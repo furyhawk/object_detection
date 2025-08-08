@@ -8,6 +8,7 @@ import os
 from od.utils.config import Config
 from od.trainers import run_train, run_validate
 from od.data import ensure_roboflow_dataset
+import importlib
 
 
 def build_base_parser() -> argparse.ArgumentParser:
@@ -72,18 +73,30 @@ def main_download() -> None:
     load_dotenv()
     args = build_base_parser().parse_args()
     cfg = Config.load(args.config, overrides=parse_overrides(args.override))
-    path = ensure_roboflow_dataset(
-        api_key=cfg.roboflow.api_key,
-        workspace=cfg.roboflow.workspace,
-        project=cfg.roboflow.project,
-        version=cfg.roboflow.version,
-        split=cfg.roboflow.split,
-        location=cfg.roboflow.location,
-        format=cfg.roboflow.format,
-    )
     from od.data import find_data_yaml
-    yaml_path = find_data_yaml(path)
-    print(f"Dataset downloaded to: {path}")
+    if (cfg.dataset.source or "roboflow").lower() == "cvat":
+        cvat_mod = importlib.import_module("od.data.cvat")
+        path = cvat_mod.prepare_cvat_dataset(
+            zip_path=cfg.cvat.zip_path,
+            root=cfg.cvat.root,
+            location=cfg.cvat.location,
+            format=cfg.cvat.format,
+            names=cfg.cvat.names,
+        )
+        yaml_path = find_data_yaml(path)
+        print(f"CVAT dataset prepared at: {path}")
+    else:
+        path = ensure_roboflow_dataset(
+            api_key=cfg.roboflow.api_key,
+            workspace=cfg.roboflow.workspace,
+            project=cfg.roboflow.project,
+            version=cfg.roboflow.version,
+            split=cfg.roboflow.split,
+            location=cfg.roboflow.location,
+            format=cfg.roboflow.format,
+        )
+        yaml_path = find_data_yaml(path)
+        print(f"Dataset downloaded to: {path}")
     if yaml_path:
         print(f"Detected data.yaml: {yaml_path}")
     else:
@@ -118,17 +131,30 @@ if __name__ == "__main__":
     elif args.command == "validate":
         run_validate(cfg)
     elif args.command == "download":
-        path = ensure_roboflow_dataset(
-            api_key=cfg.roboflow.api_key,
-            workspace=cfg.roboflow.workspace,
-            project=cfg.roboflow.project,
-            version=cfg.roboflow.version,
-            split=cfg.roboflow.split,
-            location=cfg.roboflow.location,
-            format=cfg.roboflow.format,
-        )
-        from od.data import find_data_yaml
-        yaml_path = find_data_yaml(path)
-        print(f"Dataset downloaded to: {path}")
+        if (cfg.dataset.source or "roboflow").lower() == "cvat":
+            cvat_mod = importlib.import_module("od.data.cvat")
+            path = cvat_mod.prepare_cvat_dataset(
+                zip_path=cfg.cvat.zip_path,
+                root=cfg.cvat.root,
+                location=cfg.cvat.location,
+                format=cfg.cvat.format,
+                names=cfg.cvat.names,
+            )
+            from od.data import find_data_yaml
+            yaml_path = find_data_yaml(path)
+            print(f"CVAT dataset prepared at: {path}")
+        else:
+            path = ensure_roboflow_dataset(
+                api_key=cfg.roboflow.api_key,
+                workspace=cfg.roboflow.workspace,
+                project=cfg.roboflow.project,
+                version=cfg.roboflow.version,
+                split=cfg.roboflow.split,
+                location=cfg.roboflow.location,
+                format=cfg.roboflow.format,
+            )
+            from od.data import find_data_yaml
+            yaml_path = find_data_yaml(path)
+            print(f"Dataset downloaded to: {path}")
         if yaml_path:
             print(f"Detected data.yaml: {yaml_path}")

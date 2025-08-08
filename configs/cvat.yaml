@@ -1,19 +1,10 @@
 # Example configuration for training/validation with Roboflow or CVAT + Ultralytics
 dataset:
-  source: roboflow   # options: roboflow | cvat
-roboflow:
-  # api_key: null            # optional; will read from ROBOFLOW_API_KEY if null
-  workspace: your-workspace
-  project: your-project
-  version: 1
-  split: yolov8              # export format; 'yolov8' recommended
-  format: null               # override export format if needed
-  location: ./data           # where to store dataset
-  # data_yaml: ./data/your-dataset/data.yaml  # optional explicit path if auto-detection fails
+  source: cvat   # options: roboflow | cvat
 
 cvat:
   # Provide either a path to a CVAT export zip, or a root directory of an extracted export.
-  zip_path: null           # e.g., ./exports/my_cvat_export.zip
+  zip_path: ./data/project_2_dataset_2025_08_08_13_38_51_ultralytics yolo detection 1.0.zip           # e.g., ./exports/my_cvat_export.zip
   root: null               # e.g., ./data/my-cvat-dataset
   location: ./data         # where to extract if zip_path is provided
   format: null             # optional: yolo | coco (auto-detected if null)
@@ -25,7 +16,7 @@ model:
   arch: yolov8n.pt           # model name or path to checkpoint
   imgsz: 640
   lr: 0.001
-  epochs: 50
+  epochs: 20
   batch: 16
   device: null               # e.g. "cuda:0" or [0,1]
   seed: 42

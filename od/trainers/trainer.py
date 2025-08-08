@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 
 from od.utils.config import Config
 from od.data import ensure_roboflow_dataset, find_data_yaml
+import importlib
 from od.models import UltralyticsBackend
 
 
@@ -21,22 +22,39 @@ essential_yaml_error = (
 
 
 def run_train(cfg: Config, overrides: Optional[Dict[str, Any]] = None) -> Any:
-    # If an explicit data.yaml is provided, use it and skip download
-    if cfg.roboflow.data_yaml:
-        data_yaml_opt: Optional[Path] = Path(cfg.roboflow.data_yaml)
-        ds_path = data_yaml_opt.parent if data_yaml_opt else Path(cfg.roboflow.location)
+    # Select dataset source
+    source = (cfg.dataset.source or "roboflow").lower()
+    if source == "roboflow":
+        if cfg.roboflow.data_yaml:
+            data_yaml_opt: Optional[Path] = Path(cfg.roboflow.data_yaml)
+            ds_path = data_yaml_opt.parent if data_yaml_opt else Path(cfg.roboflow.location)
+        else:
+            ds_path = ensure_roboflow_dataset(
+                api_key=cfg.roboflow.api_key,
+                workspace=cfg.roboflow.workspace,
+                project=cfg.roboflow.project,
+                version=cfg.roboflow.version,
+                split=cfg.roboflow.split,
+                location=cfg.roboflow.location,
+                format=cfg.roboflow.format,
+            )
+            data_yaml_opt = find_data_yaml(Path(ds_path))
+    elif source == "cvat":
+        cvat_mod = importlib.import_module("od.data.cvat")
+        if cfg.cvat.data_yaml:
+            data_yaml_opt = Path(cfg.cvat.data_yaml)
+            ds_path = data_yaml_opt.parent
+        else:
+            ds_path = cvat_mod.prepare_cvat_dataset(
+                zip_path=cfg.cvat.zip_path,
+                root=cfg.cvat.root,
+                location=cfg.cvat.location,
+                format=cfg.cvat.format,
+                names=cfg.cvat.names,
+            )
+            data_yaml_opt = find_data_yaml(Path(ds_path))
     else:
-        # Download dataset
-        ds_path = ensure_roboflow_dataset(
-            api_key=cfg.roboflow.api_key,
-            workspace=cfg.roboflow.workspace,
-            project=cfg.roboflow.project,
-            version=cfg.roboflow.version,
-            split=cfg.roboflow.split,
-            location=cfg.roboflow.location,
-            format=cfg.roboflow.format,
-        )
-        data_yaml_opt = find_data_yaml(Path(ds_path))
+        raise NotImplementedError(f"Dataset source '{source}' is not supported.")
     if not data_yaml_opt:
         raise FileNotFoundError(essential_yaml_error)
     data_yaml = data_yaml_opt
@@ -58,23 +76,44 @@ def run_train(cfg: Config, overrides: Optional[Dict[str, Any]] = None) -> Any:
 
 
 def run_validate(cfg: Config, overrides: Optional[Dict[str, Any]] = None) -> Any:
-    if cfg.roboflow.data_yaml:
-        data_yaml = Path(cfg.roboflow.data_yaml)
-        ds_path = data_yaml.parent
+    source = (cfg.dataset.source or "roboflow").lower()
+    if source == "roboflow":
+        if cfg.roboflow.data_yaml:
+            data_yaml = Path(cfg.roboflow.data_yaml)
+            ds_path = data_yaml.parent
+        else:
+            ds_path = ensure_roboflow_dataset(
+                api_key=cfg.roboflow.api_key,
+                workspace=cfg.roboflow.workspace,
+                project=cfg.roboflow.project,
+                version=cfg.roboflow.version,
+                split=cfg.roboflow.split,
+                location=cfg.roboflow.location,
+                format=cfg.roboflow.format,
+            )
+            data_yaml_opt = find_data_yaml(Path(ds_path))
+            if not data_yaml_opt:
+                raise FileNotFoundError(essential_yaml_error)
+            data_yaml = data_yaml_opt
+    elif source == "cvat":
+        cvat_mod = importlib.import_module("od.data.cvat")
+        if cfg.cvat.data_yaml:
+            data_yaml = Path(cfg.cvat.data_yaml)
+            ds_path = data_yaml.parent
+        else:
+            ds_path = cvat_mod.prepare_cvat_dataset(
+                zip_path=cfg.cvat.zip_path,
+                root=cfg.cvat.root,
+                location=cfg.cvat.location,
+                format=cfg.cvat.format,
+                names=cfg.cvat.names,
+            )
+            data_yaml_opt = find_data_yaml(Path(ds_path))
+            if not data_yaml_opt:
+                raise FileNotFoundError("Could not find a data YAML in the prepared CVAT dataset.")
+            data_yaml = data_yaml_opt
     else:
-        ds_path = ensure_roboflow_dataset(
-            api_key=cfg.roboflow.api_key,
-            workspace=cfg.roboflow.workspace,
-            project=cfg.roboflow.project,
-            version=cfg.roboflow.version,
-            split=cfg.roboflow.split,
-            location=cfg.roboflow.location,
-            format=cfg.roboflow.format,
-        )
-        data_yaml_opt = find_data_yaml(Path(ds_path))
-        if not data_yaml_opt:
-            raise FileNotFoundError(essential_yaml_error)
-        data_yaml = data_yaml_opt
+        raise NotImplementedError(f"Dataset source '{source}' is not supported.")
 
     backend = _select_backend(cfg.model.backend, cfg.model.arch, cfg.model.device)
 

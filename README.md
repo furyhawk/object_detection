@@ -33,7 +33,12 @@ Copy and edit the example config:
 cp configs/example.yaml configs/my.yaml
 ```
 
-Set your Roboflow details in `configs/my.yaml`:
+Set your dataset source and details in `configs/my.yaml`:
+- `dataset.source`: `roboflow` (default) or `cvat`
+	- If `roboflow`, set: `roboflow.workspace`, `roboflow.project`, `roboflow.version` and have `ROBOFLOW_API_KEY` in env or `roboflow.api_key` in config.
+	- If `cvat`, provide either `cvat.zip_path` (a CVAT export zip) or `cvat.root` (an extracted directory). The tool will try to generate a `data.yaml` if missing.
+
+For Roboflow, typical fields:
 
 - `workspace`, `project`, `version`
 - Optionally set `ROBOFLOW_API_KEY` env var, or put `roboflow.api_key` in the config.
@@ -52,7 +57,7 @@ Validate:
 od-validate -c configs/my.yaml
 ```
 
-Download dataset only:
+Download or prepare dataset only:
 
 ```bash
 od-download -c configs/my.yaml
@@ -70,4 +75,5 @@ Outputs are written to `runs/train/...` and `runs/val/...` following Ultralytics
 
 - Currently only the Ultralytics backend is wired. The structure allows adding other backends (e.g., Hugging Face DETR) later.
 - Roboflow export format should be `yolov8` to include a `data.yaml` compatible with Ultralytics.
+- For CVAT, both YOLO and COCO exports are supported; YOLO is recommended for easiest setup. If no `data.yaml` exists, we'll try to create one based on the images/labels layout.
 

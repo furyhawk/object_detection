@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 from omegaconf import OmegaConf
 import os
 
@@ -16,6 +16,23 @@ class RoboflowConfig:
     format: str | None = None  # override if needed
     location: str = "./data"
     data_yaml: Optional[str] = None  # optional explicit path to data.yaml
+
+
+@dataclass
+class CvatConfig:
+    # Source for CVAT datasets. Provide either a zip file exported from CVAT or a root directory.
+    zip_path: Optional[str] = None          # path to a CVAT export zip (YOLO or COCO). If provided, will be extracted.
+    root: Optional[str] = None              # alternatively, path to an already-extracted dataset directory
+    location: str = "./data"               # where to extract/prep the dataset (if zip provided)
+    format: Optional[str] = None            # optional hint: "yolo" or "coco"; if None, will auto-detect
+    data_yaml: Optional[str] = None         # optional explicit path to data.yaml if already present
+    names: Optional[List[str]] = None       # optional class names; used when not discoverable in export
+
+
+@dataclass
+class DatasetConfig:
+    # Which dataset source to use. Supported: 'roboflow' (default), 'cvat'
+    source: str = "roboflow"
 
 
 @dataclass
@@ -48,6 +65,8 @@ class ValConfig:
 @dataclass
 class Config:
     roboflow: RoboflowConfig = field(default_factory=RoboflowConfig)
+    cvat: CvatConfig = field(default_factory=CvatConfig)
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     val: ValConfig = field(default_factory=ValConfig)
