@@ -1,0 +1,29 @@
+# Example configuration for training/validation with Roboflow + Ultralytics
+roboflow:
+  # api_key: null            # optional; will read from ROBOFLOW_API_KEY if null
+  workspace: augmented-startups
+  project: playing-cards-ow27d
+  version: 4
+  split: yolov8              # export format; 'yolov8' recommended
+  format: null               # override export format if needed
+  location: ./data           # where to store dataset
+  data_yaml: ./data/data.yaml
+
+model:
+  backend: ultralytics       # only 'ultralytics' supported for now
+  arch: yolov8n.pt           # model name or path to checkpoint
+  imgsz: 640
+  lr: 0.001
+  epochs: 2
+  batch: 16
+  device: null               # e.g. "cuda:0" or [0,1]
+  seed: 42
+
+train:
+  project_dir: runs/train
+  name: exp
+  resume: false
+
+val:
+  project_dir: runs/val
+  name: exp

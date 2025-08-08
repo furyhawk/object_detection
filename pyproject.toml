@@ -1,0 +1,62 @@
+[project]
+name = "object-detection"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.9.0",
+    "albumentations>=2.0.8",
+    "coco-eval>=0.0.4",
+    "ipykernel>=6.30.0",
+    "ipywidgets>=8.1.7",
+    "matplotlib>=3.10.3",
+    "ninja>=1.11.1.4",
+    "pillow>=11.3.0",
+    "pycocotools>=2.0.10",
+    "pytorch-lightning>=2.5.2",
+    "roboflow>=1.2.3",
+    "seaborn>=0.13.2",
+    "supervision>=0.26.1",
+    "tensorboard>=2.20.0",
+    "timm>=1.0.19",
+    "torchmetrics>=1.8.0",
+    "transformers>=4.53.3",
+    "types-requests>=2.32.4.20250611",
+    "ultralytics>=8.3.170",
+    "omegaconf>=2.3.0",
+  "python-dotenv>=1.0.1",
+]
+
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+  { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv]
+package = true
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["od*"]
+exclude = ["configs*", "*.ipynb"]
+
+[tool.setuptools.package-data]
+od = ["py.typed"]
+
+[project.scripts]
+od-train = "od.cli:main_train"
+od-validate = "od.cli:main_validate"
+od-download = "od.cli:main_download"
