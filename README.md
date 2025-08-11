@@ -1,12 +1,18 @@
 # Object Detection - Config-Driven Training/Validation
 
-This project now includes a small framework to train and validate object detection models using configuration files, with dataset downloads from Roboflow and an Ultralytics YOLO backend.
+This project now includes a small framework to train and validate object detection models using configuration files, with dataset downloads from Roboflow / CVAT and two backends:
+
+- Ultralytics YOLO (yolov8*)
+- Hugging Face Transformers Deformable DETR (e.g. SenseTime/deformable-detr-with-box-refine)
 
 ## Features
 
-- Config (YAML) controls dataset (Roboflow), model, and run settings
+- Config (YAML) controls dataset (Roboflow or CVAT), model, and run settings
 - Roboflow integration: download datasets on demand
-- Ultralytics backend for training/validation
+- CVAT integration: point to export zip or extracted folder (YOLO / COCO)
+- Backends:
+	- Ultralytics (training, validation, export)
+	- Transformers (Deformable DETR) minimal fine-tuning loop (loss + basic val loss)
 - Simple CLI entry points
 
 ## Install
@@ -69,11 +75,29 @@ Override options at runtime (dotlist):
 od-train -c configs/my.yaml -o model.epochs=100 -o model.arch=yolov8s.pt -o model.device=cuda:0
 ```
 
-Outputs are written to `runs/train/...` and `runs/val/...` following Ultralytics conventions.
+Outputs are written to `runs/train/...` and `runs/val/...` directories.
+
+### Using the Transformers (Deformable DETR) backend
+
+Example override to train Deformable DETR:
+
+```bash
+od-train -c configs/my.yaml \
+	-o model.backend=transformers \
+	-o model.arch=SenseTime/deformable-detr-with-box-refine \
+	-o model.epochs=10 \
+	-o model.batch=2 \
+	-o model.imgsz=512
+```
+
+Notes:
+* Start with a small batch size (2) – Deformable DETR uses more GPU memory than YOLO.
+* Validation currently reports only average loss (no mAP yet). A COCO-style evaluation utility can be added later.
+* Final weights + processor are saved in the run directory via `save_pretrained`.
 
 ## Notes
 
-- Currently only the Ultralytics backend is wired. The structure allows adding other backends (e.g., Hugging Face DETR) later.
-- Roboflow export format should be `yolov8` to include a `data.yaml` compatible with Ultralytics.
-- For CVAT, both YOLO and COCO exports are supported; YOLO is recommended for easiest setup. If no `data.yaml` exists, we'll try to create one based on the images/labels layout.
+- Roboflow export format should be `yolov8` (recommended) or `coco` depending on backend preference.
+- For CVAT, both YOLO and COCO exports are supported; YOLO is recommended for easiest setup. If no `data.yaml` exists, the tooling attempts to assemble one.
+- Transformers backend is an initial implementation (loss-focused). Future enhancements may include: COCO mAP, AMP, gradient accumulation, checkpoint resume.
 

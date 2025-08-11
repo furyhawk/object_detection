@@ -12,12 +12,12 @@ cvat:
   names: null              # optional class name list when not present in export
 
 model:
-  backend: ultralytics       # ultralytics | transformers
-  arch: yolov8n.pt           # yolov8n.pt or SenseTime/deformable-detr-with-box-refine when backend=transformers
-  imgsz: 640
-  lr: 0.001
-  epochs: 20
-  batch: 16
+  backend: transformers       # ultralytics | transformers
+  arch: SenseTime/deformable-detr-with-box-refine           # yolov8n.pt or SenseTime/deformable-detr-with-box-refine when backend=transformers
+  imgsz: 512                  # reduce for memory when using transformers
+  lr: 0.0002                  # smaller LR often better for fine-tuning
+  epochs: 2
+  batch: 2                    # reduce batch to avoid OOM
   device: null               # e.g. "cuda:0" or [0,1]
   seed: 42
 
