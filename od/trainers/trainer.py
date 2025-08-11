@@ -6,12 +6,14 @@ from typing import Any, Dict, Optional
 from od.utils.config import Config
 from od.data import ensure_roboflow_dataset, find_data_yaml
 import importlib
-from od.models import UltralyticsBackend
+from od.models import UltralyticsBackend, TransformersDeformableDetrBackend
 
 
 def _select_backend(name: str, arch: str, device: Optional[str]):
     if name.lower() == "ultralytics":
         return UltralyticsBackend(arch=arch, device=device)
+    if name.lower() == "transformers":
+        return TransformersDeformableDetrBackend(arch=arch, device=device)
     raise NotImplementedError(f"Backend '{name}' is not supported yet")
 
 

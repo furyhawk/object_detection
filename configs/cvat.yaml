@@ -12,8 +12,8 @@ cvat:
   names: null              # optional class name list when not present in export
 
 model:
-  backend: ultralytics       # only 'ultralytics' supported for now
-  arch: yolov8n.pt           # model name or path to checkpoint
+  backend: ultralytics       # ultralytics | transformers
+  arch: yolov8n.pt           # yolov8n.pt or SenseTime/deformable-detr-with-box-refine when backend=transformers
   imgsz: 640
   lr: 0.001
   epochs: 20

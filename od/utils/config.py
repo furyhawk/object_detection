@@ -37,8 +37,8 @@ class DatasetConfig:
 
 @dataclass
 class ModelConfig:
-    backend: str = "ultralytics"  # ultralytics | transformers (future)
-    arch: str = "yolov8n.pt"  # can be a model name or path to checkpoint
+    backend: str = "ultralytics"  # ultralytics | transformers
+    arch: str = "yolov8n.pt"  # yolov8n.pt or HF id e.g. SenseTime/deformable-detr-with-box-refine
     imgsz: int = 640
     lr: float = 0.001
     epochs: int = 100
