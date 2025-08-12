@@ -16,8 +16,8 @@ model:
   arch: SenseTime/deformable-detr-with-box-refine           # yolov8n.pt or SenseTime/deformable-detr-with-box-refine when backend=transformers
   imgsz: 512                  # reduce for memory when using transformers
   lr: 0.0002                  # smaller LR often better for fine-tuning
-  epochs: 2
-  batch: 2                    # reduce batch to avoid OOM
+  epochs: 8
+  batch: 4                    # reduce batch to avoid OOM
   device: null               # e.g. "cuda:0" or [0,1]
   seed: 42
 

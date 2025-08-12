@@ -11,6 +11,10 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
+try:  # torchmetrics is optional but listed as dependency
+    from torchmetrics.detection.mean_ap import MeanAveragePrecision  # type: ignore
+except Exception:  # pragma: no cover
+    MeanAveragePrecision = None  # type: ignore
 try:
     from omegaconf import OmegaConf  # type: ignore
 except ImportError:  # pragma: no cover - fallback path
@@ -339,6 +343,17 @@ class TransformersDeformableDetrBackend:
                             if isinstance(v, torch.Tensor) and v.device.type != self.device:
                                 lab[k] = v.to(self.device)
 
+        # Setup validation metric object once (re-used each epoch)
+        map_metric = None
+        if MeanAveragePrecision is not None:
+            try:
+                map_metric = MeanAveragePrecision()
+            except Exception as e:  # pragma: no cover
+                print(f"[WARN] Could not initialize MeanAveragePrecision: {e}")
+                map_metric = None
+
+        score_thresh = float((extra or {}).get("val_score_thresh", 0.05))
+
         for epoch in range(epochs):
             epoch_loss = 0.0
             for batch_idx, batch_inputs in enumerate(train_loader):
@@ -379,18 +394,100 @@ class TransformersDeformableDetrBackend:
                 epoch_loss += loss.item()
             avg_loss = epoch_loss / max(1, len(train_loader))
 
-            # Simple val loss (without grad)
+            # Validation: compute loss and (optionally) detection metrics (mAP)
             self.model.eval()
             with torch.no_grad():
                 val_loss = 0.0
+                if map_metric is not None:
+                    map_metric.reset()
                 for batch_inputs in val_loader:
                     move_labels_inplace(batch_inputs)
                     outputs = self.model(**batch_inputs)  # type: ignore[arg-type]
                     val_loss += outputs.loss.item()
+
+                    if map_metric is not None:
+                        try:
+                            # Extract predictions
+                            logits = getattr(outputs, "logits", None)
+                            pred_boxes = getattr(outputs, "pred_boxes", None)
+                            if logits is None or pred_boxes is None:
+                                continue
+                            probs = logits.softmax(-1)[..., :-1]  # drop background
+                            scores, labels_pred = probs.max(-1)
+                            boxes_cxcywh = pred_boxes  # normalized cxcywh in 0..1
+                            # Convert to xyxy absolute (after resize all imgs are imgsz x imgsz)
+                            cx, cy, w_, h_ = boxes_cxcywh.unbind(-1)
+                            x1 = (cx - 0.5 * w_) * imgsz
+                            y1 = (cy - 0.5 * h_) * imgsz
+                            x2 = (cx + 0.5 * w_) * imgsz
+                            y2 = (cy + 0.5 * h_) * imgsz
+                            boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=-1)
+                            # Clamp
+                            boxes_xyxy = boxes_xyxy.clamp(min=0, max=imgsz)
+
+                            batch_preds = []
+                            B, Q = scores.shape
+                            for bi in range(B):
+                                sc = scores[bi]
+                                lb = labels_pred[bi]
+                                bx = boxes_xyxy[bi]
+                                keep = sc > score_thresh
+                                if keep.any():
+                                    batch_preds.append({
+                                        "boxes": bx[keep].detach().cpu(),
+                                        "scores": sc[keep].detach().cpu(),
+                                        "labels": lb[keep].detach().cpu(),
+                                    })
+                                else:
+                                    batch_preds.append({
+                                        "boxes": torch.zeros((0, 4)),
+                                        "scores": torch.zeros((0,)),
+                                        "labels": torch.zeros((0,), dtype=torch.long),
+                                    })
+
+                            # Targets: convert normalized cxcywh to xyxy absolute
+                            tgt_list = []
+                            targets = batch_inputs.get("labels") if isinstance(batch_inputs, dict) else None
+                            if isinstance(targets, list):
+                                for t in targets:
+                                    if not isinstance(t, dict):
+                                        tgt_list.append({"boxes": torch.zeros((0, 4)), "labels": torch.zeros((0,), dtype=torch.long)})
+                                        continue
+                                    tb = t.get("boxes")
+                                    tl = t.get("class_labels")
+                                    if isinstance(tb, torch.Tensor) and isinstance(tl, torch.Tensor):
+                                        if tb.numel():
+                                            cx, cy, w_, h_ = tb.unbind(-1)
+                                            x1 = (cx - 0.5 * w_) * imgsz
+                                            y1 = (cy - 0.5 * h_) * imgsz
+                                            x2 = (cx + 0.5 * w_) * imgsz
+                                            y2 = (cy + 0.5 * h_) * imgsz
+                                            boxes = torch.stack([x1, y1, x2, y2], dim=-1)
+                                        else:
+                                            boxes = torch.zeros((0, 4))
+                                        tgt_list.append({"boxes": boxes.detach().cpu(), "labels": tl.detach().cpu()})
+                                    else:
+                                        tgt_list.append({"boxes": torch.zeros((0, 4)), "labels": torch.zeros((0,), dtype=torch.long)})
+                            if tgt_list:
+                                map_metric.update(batch_preds, tgt_list)  # type: ignore[arg-type]
+                        except Exception as me:  # pragma: no cover
+                            print(f"[WARN] mAP metric update failed: {me}")
                 val_loss = val_loss / max(1, len(val_loader))
+                map_vals: Dict[str, float] = {}
+                if map_metric is not None:
+                    try:
+                        computed = {k: float(v) for k, v in map_metric.compute().items()}  # type: ignore[assignment]
+                        # Standard keys: map, map_50, map_75
+                        map_vals = {
+                            "map": computed.get("map", float("nan")),
+                            "map50": computed.get("map_50", float("nan")),
+                            "map75": computed.get("map_75", float("nan")),
+                        }
+                    except Exception as ce:  # pragma: no cover
+                        print(f"[WARN] mAP compute failed: {ce}")
             self.model.train()
 
-            metrics = {"epoch": epoch + 1, "train_loss": avg_loss, "val_loss": val_loss}
+            metrics = {"epoch": epoch + 1, "train_loss": avg_loss, "val_loss": val_loss, **map_vals}
             history.append(metrics)
             # Persist running log
             with (out_dir / "history.jsonl").open("a") as f:
@@ -398,8 +495,12 @@ class TransformersDeformableDetrBackend:
 
             # Console progress output (one line per epoch)
             try:
+                extra_msg = ""
+                if "map" in metrics:
+                    m = metrics
+                    extra_msg = f" map={m.get('map', float('nan')):.4f} map50={m.get('map50', float('nan')):.4f} map75={m.get('map75', float('nan')):.4f}"
                 print(
-                    f"[INFO] Epoch {epoch + 1}/{epochs} | train_loss={avg_loss:.4f} val_loss={val_loss:.4f}"
+                    f"[INFO] Epoch {epoch + 1}/{epochs} | train_loss={avg_loss:.4f} val_loss={val_loss:.4f}{extra_msg}"
                 )
             except Exception:
                 pass
