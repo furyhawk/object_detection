@@ -10,7 +10,7 @@ warnings.filterwarnings("ignore", message=r"for .*meta parameter")
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
-from PIL import Image
+from PIL import Image, ImageDraw
 try:  # torchmetrics is optional but listed as dependency
     from torchmetrics.detection.mean_ap import MeanAveragePrecision  # type: ignore
 except Exception:  # pragma: no cover
@@ -561,6 +561,16 @@ class TransformersDeformableDetrBackend:
         self.model.eval()
         losses: List[float] = []
         preds_collected: int = 0
+        # Visualization setup
+        ex = extra or {}
+        score_thresh = float(ex.get("val_score_thresh", 0.05))
+        vis_max = int(ex.get("val_vis_max", 20))  # number of validation images to dump (0 = disable)
+        vis_dir = out_dir / "val_vis"
+        if vis_max > 0:
+            vis_dir.mkdir(parents=True, exist_ok=True)
+        saved_images = 0
+        mean = getattr(self.image_processor, "image_mean", [0.0, 0.0, 0.0])
+        std = getattr(self.image_processor, "image_std", [1.0, 1.0, 1.0])
         with torch.no_grad():
             for batch_inputs in val_loader:
                 batch_inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch_inputs.items()}
@@ -576,11 +586,95 @@ class TransformersDeformableDetrBackend:
                 outputs = self.model(**batch_inputs)
                 losses.append(outputs.loss.item())
                 preds_collected += batch_inputs["pixel_values"].shape[0]
+
+                # Visualization logic (pred vs ground truth)
+                if vis_max > 0 and saved_images < vis_max:
+                    try:
+                        logits = getattr(outputs, "logits", None)
+                        pred_boxes = getattr(outputs, "pred_boxes", None)
+                        if logits is None or pred_boxes is None:
+                            continue
+                        probs = logits.softmax(-1)[..., :-1]  # drop background
+                        scores, labels_pred = probs.max(-1)
+                        boxes_cxcywh = pred_boxes  # (B, Q, 4) normalized
+                        B, Q, _ = boxes_cxcywh.shape
+                        cx, cy, w_, h_ = boxes_cxcywh.unbind(-1)
+                        x1 = (cx - 0.5 * w_) * imgsz
+                        y1 = (cy - 0.5 * h_) * imgsz
+                        x2 = (cx + 0.5 * w_) * imgsz
+                        y2 = (cy + 0.5 * h_) * imgsz
+                        boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=-1).clamp(min=0, max=imgsz)
+
+                        labels_list = batch_inputs.get("labels") if isinstance(batch_inputs, dict) else None
+                        for bi in range(B):
+                            if saved_images >= vis_max:
+                                break
+                            # Reconstruct image (unnormalize)
+                            pv = batch_inputs["pixel_values"][bi].detach().cpu()
+                            try:
+                                img_np = pv.clone()
+                                if isinstance(mean, list) and isinstance(std, list) and len(mean) == len(std) == img_np.shape[0]:
+                                    for c in range(img_np.shape[0]):
+                                        img_np[c] = img_np[c] * std[c] + mean[c]
+                                img_np = (img_np * 255.0).clamp(0, 255).byte().permute(1, 2, 0).numpy()
+                            except Exception:
+                                # Fallback simple scaling
+                                img_np = (pv * 255.0).clamp(0, 255).byte().permute(1, 2, 0).numpy()
+                            vis_img = Image.fromarray(img_np)
+                            draw = ImageDraw.Draw(vis_img)
+
+                            # Predicted boxes
+                            sc = scores[bi]
+                            lb = labels_pred[bi]
+                            bx = boxes_xyxy[bi]
+                            keep = sc > score_thresh
+                            for pj in torch.nonzero(keep, as_tuple=False).flatten().tolist():
+                                box = bx[pj].detach().cpu().tolist()
+                                cls_id = int(lb[pj].detach().cpu().item())
+                                conf = float(sc[pj].detach().cpu().item())
+                                cls_name = class_names[cls_id] if class_names and cls_id < len(class_names) else str(cls_id)
+                                x1b, y1b, x2b, y2b = box
+                                draw.rectangle([x1b, y1b, x2b, y2b], outline="red", width=2)
+                                draw.text((x1b + 2, y1b + 2), f"P {cls_name}:{conf:.2f}", fill="red")
+
+                            # Ground truth boxes (in labels_list normalized cxcywh)
+                            if isinstance(labels_list, list) and bi < len(labels_list):
+                                gt_entry = labels_list[bi]
+                                if isinstance(gt_entry, dict):
+                                    gtb = gt_entry.get("boxes")
+                                    gtl = gt_entry.get("class_labels")
+                                    if isinstance(gtb, torch.Tensor) and isinstance(gtl, torch.Tensor):
+                                        if gtb.numel():
+                                            cxg, cyg, wg, hg = gtb.unbind(-1)
+                                            x1g = (cxg - 0.5 * wg) * imgsz
+                                            y1g = (cyg - 0.5 * hg) * imgsz
+                                            x2g = (cxg + 0.5 * wg) * imgsz
+                                            y2g = (cyg + 0.5 * hg) * imgsz
+                                            gt_xyxy = torch.stack([x1g, y1g, x2g, y2g], dim=-1).detach().cpu()
+                                            for gj in range(gt_xyxy.shape[0]):
+                                                boxg = gt_xyxy[gj].tolist()
+                                                cls_idg = int(gtl[gj].detach().cpu().item())
+                                                cls_name_g = class_names[cls_idg] if class_names and cls_idg < len(class_names) else str(cls_idg)
+                                                draw.rectangle(boxg, outline="green", width=2)
+                                                draw.text((boxg[0] + 2, boxg[1] + 2), f"G {cls_name_g}", fill="green")
+                            # Save image
+                            out_path = vis_dir / f"val_{saved_images:04d}.jpg"
+                            vis_img.save(out_path)
+                            saved_images += 1
+                    except Exception as viz_e:  # pragma: no cover
+                        try:
+                            print(f"[WARN] Visualization failure: {viz_e}")
+                        except Exception:
+                            pass
         avg_loss = sum(losses) / max(1, len(losses))
         metrics = {"val_loss": avg_loss, "samples": preds_collected}
+        if vis_max > 0:
+            metrics["visualizations"] = saved_images
+            metrics["vis_dir"] = str(vis_dir)
         (out_dir / "val_metrics.json").write_text(json.dumps(metrics, indent=2))
         try:
-            print(f"[INFO] Validation finished. samples={preds_collected} val_loss={avg_loss:.4f} -> {out_dir}/val_metrics.json")
+            extra_vis = f" visualizations={saved_images} -> {vis_dir}" if vis_max > 0 else ""
+            print(f"[INFO] Validation finished. samples={preds_collected} val_loss={avg_loss:.4f}{extra_vis} -> {out_dir}/val_metrics.json")
         except Exception:
             pass
         return metrics

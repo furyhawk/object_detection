@@ -4,7 +4,7 @@ dataset:
 
 cvat:
   # Provide either a path to a CVAT export zip, or a root directory of an extracted export.
-  zip_path: ./data/project_2_dataset_2025_08_08_13_38_51_ultralytics yolo detection 1.0.zip           # e.g., ./exports/my_cvat_export.zip
+  zip_path: ./data/project_2_dataset_2025_08_12_03_00_06_ultralytics yolo detection 1.0.zip           # e.g., ./exports/my_cvat_export.zip
   root: null               # e.g., ./data/my-cvat-dataset
   location: ./data         # where to extract if zip_path is provided
   format: null             # optional: yolo | coco (auto-detected if null)
@@ -16,7 +16,7 @@ model:
   arch: SenseTime/deformable-detr-with-box-refine           # yolov8n.pt or SenseTime/deformable-detr-with-box-refine when backend=transformers
   imgsz: 512                  # reduce for memory when using transformers
   lr: 0.0002                  # smaller LR often better for fine-tuning
-  epochs: 8
+  epochs: 2
   batch: 4                    # reduce batch to avoid OOM
   device: null               # e.g. "cuda:0" or [0,1]
   seed: 42
