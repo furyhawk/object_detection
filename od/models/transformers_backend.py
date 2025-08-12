@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Callable
 import warnings
 warnings.filterwarnings("ignore", message=r"for .*meta parameter")
 
@@ -45,83 +45,67 @@ class _Sample:
 
 
 class YOLODetectionDataset(Dataset):
-    """Dataset that reads a YOLO-style data.yaml and label txt files and produces COCO-like annotations.
+    """YOLO format dataset with optional Albumentations-like augmentation.
 
-    Expected label format per line: class x_center y_center width height (all normalized 0-1)
-    The annotation dict produced follows the subset expected by HuggingFace image processors:
-      {"image_id": int, "annotations": [{"bbox": [x_min, y_min, w, h], "category_id": int}, ...]}
+    transform: callable(image: PIL.Image, anns: List[dict]) -> (image, anns)
     """
 
-    def __init__(self, data_yaml: Path, split: str = "train"):
+    def __init__(self, data_yaml: Path, split: str = "train", transform: Optional[Callable[[Image.Image, List[Dict[str, Any]]], Tuple[Image.Image, List[Dict[str, Any]]]]] = None):
+        self.split = split
+        self.transform = transform
         yroot = _read_yaml(data_yaml)
-        # Resolve split path(s)
-        if split not in yroot:
-            # Some YAMLs use 'val' vs 'validation'
-            alt = "val" if split == "validation" else "validation"
-            if alt in yroot:
-                split_key = alt
-            else:
-                raise KeyError(f"Split '{split}' not found in data yaml: keys={list(yroot.keys())}")
-        else:
-            split_key = split
-        split_entry = yroot[split_key]
-        if isinstance(split_entry, str):
-            # Could be path to a directory or a txt file listing images
-            split_paths: List[Path]
-            p = Path(split_entry)
+        # Determine image paths for the split
+        key = split if split in yroot else ("val" if split == "validation" else "validation")
+        if key not in yroot:
+            raise KeyError(f"Split '{split}' not present in data yaml")
+        entry = yroot[key]
+        paths: List[Path] = []
+        if isinstance(entry, str):
+            p = Path(entry)
             if p.suffix.lower() == ".txt" and p.exists():
                 with p.open() as f:
-                    split_paths = [Path(line.strip()) for line in f if line.strip()]
+                    paths = [Path(l.strip()) for l in f if l.strip()]
+            elif p.is_dir():
+                paths = [pp for pp in p.rglob("*") if pp.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}]
             else:
-                # gather images under directory recursively
-                if p.is_dir():
-                    split_paths = [pp for pp in p.rglob("*") if pp.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}]
-                else:
-                    raise FileNotFoundError(f"Split path not found: {p}")
-        elif isinstance(split_entry, list):
-            split_paths = []
-            for entry in split_entry:
-                ep = Path(entry)
+                raise FileNotFoundError(f"Split path not found: {p}")
+        elif isinstance(entry, list):
+            for e in entry:
+                ep = Path(e)
                 if ep.is_dir():
-                    split_paths.extend([pp for pp in ep.rglob("*") if pp.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}])
+                    paths.extend([pp for pp in ep.rglob("*") if pp.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}])
                 else:
-                    split_paths.append(ep)
+                    paths.append(ep)
         else:
-            raise TypeError(f"Unsupported split entry type: {type(split_entry)}")
-
+            raise TypeError("Unsupported split entry type")
+        self.images = paths
         names = yroot.get("names")
-        if isinstance(names, dict):  # sometimes dict of id:name
-            # Ensure order by id
+        if isinstance(names, dict):
             ordered = [names[k] for k in sorted(names.keys(), key=lambda x: int(x))]
             self.class_names = ordered
         else:
             self.class_names = names or []
-
-        self.images: List[Path] = split_paths
         self.data_yaml = data_yaml
-        self.split = split
 
     def __len__(self) -> int:
         return len(self.images)
 
-    def _label_path(self, img_path: Path) -> Path:
-        # Typical structure: images/... -> labels/... with same stem and .txt
+    @staticmethod
+    def _label_path(img_path: Path) -> Path:
         parts = list(img_path.parts)
         try:
-            idx = parts.index("images")
-            parts[idx] = "labels"
+            i = parts.index("images")
+            parts[i] = "labels"
         except ValueError:
-            # Fallback: just replace parent dir name if it endswith images
-            if img_path.parent.name.startswith("image"):
-                parts[-2] = "labels"
+            pass
         return Path(*parts).with_suffix(".txt")
 
     def __getitem__(self, idx: int) -> _Sample:
         img_path = self.images[idx]
         img = Image.open(img_path).convert("RGB")
-        w, h = img.size
+        W, H = img.size
         label_path = self._label_path(img_path)
-        ann_list: List[Dict[str, Any]] = []
+        anns: List[Dict[str, Any]] = []
         if label_path.exists():
             with label_path.open() as f:
                 for line in f:
@@ -134,18 +118,18 @@ class YOLODetectionDataset(Dataset):
                     cls, xc, yc, bw, bh = parts
                     c = int(float(cls))
                     fx, fy, fw, fh = map(float, (xc, yc, bw, bh))
-                    # Convert to top-left width height absolute
-                    x_min = (fx - fw / 2.0) * w
-                    y_min = (fy - fh / 2.0) * h
-                    bw_abs = fw * w
-                    bh_abs = fh * h
-                    ann_list.append({
-                        "bbox": [x_min, y_min, bw_abs, bh_abs],
-                        "category_id": c,
-                        "area": bw_abs * bh_abs,
-                        "iscrowd": 0,
-                    })
-        target = {"image_id": idx, "annotations": ann_list, "width": w, "height": h}
+                    x_min = (fx - fw / 2.0) * W
+                    y_min = (fy - fh / 2.0) * H
+                    bw_abs = fw * W
+                    bh_abs = fh * H
+                    anns.append({"bbox": [x_min, y_min, bw_abs, bh_abs], "category_id": c, "area": bw_abs * bh_abs, "iscrowd": 0})
+        if self.transform and self.split == "train":
+            try:
+                img, anns = self.transform(img, anns)
+                W, H = img.size
+            except Exception as e:  # pragma: no cover
+                print(f"[WARN] augmentation failed idx={idx}: {e}")
+        target = {"image_id": idx, "annotations": anns, "width": W, "height": H}
         return _Sample(image=img, target=target)
 
 
@@ -169,9 +153,16 @@ class TransformersDeformableDetrBackend:
         data_yaml: str | Path,
         imgsz: int,
         batch: int,
+        aug_builder: Optional[Callable[[], Optional[Callable[[Image.Image, List[Dict[str, Any]]], Tuple[Image.Image, List[Dict[str, Any]]]]]]] = None,
     ) -> Tuple[DataLoader, DataLoader, List[str]]:
         data_yaml = Path(data_yaml)
-        train_ds = YOLODetectionDataset(data_yaml, split="train")
+        transform_fn = None
+        if aug_builder is not None:
+            try:
+                transform_fn = aug_builder()
+            except Exception as e:  # pragma: no cover
+                print(f"[WARN] augmentation builder failed: {e}")
+        train_ds = YOLODetectionDataset(data_yaml, split="train", transform=transform_fn)
         try:
             val_ds = YOLODetectionDataset(data_yaml, split="val")
         except Exception:
@@ -267,7 +258,94 @@ class TransformersDeformableDetrBackend:
         out_dir = Path(project) / name
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        train_loader, val_loader, class_names = self._prepare_dataloaders(data, imgsz, batch)
+        # Build augmentation pipeline if provided
+        aug_cfg = (extra or {}).get("augmentation") if extra else None
+
+        def _build_aug():  # returns callable or None
+            if not aug_cfg or not getattr(aug_cfg, "enable", False):
+                return None
+            try:
+                import albumentations as A  # type: ignore
+            except Exception:
+                print("[WARN] Albumentations not installed; skipping augmentations.")
+                return None
+            # Translate simple scalar config into Albumentations pipeline
+            hflip_p = float(getattr(aug_cfg, "hflip", 0.0))
+            brightness = float(getattr(aug_cfg, "brightness", 0.0))
+            contrast = float(getattr(aug_cfg, "contrast", 0.0))
+            hue = float(getattr(aug_cfg, "hue", 0.0))
+            saturation = float(getattr(aug_cfg, "saturation", 0.0))
+            scale_min = float(getattr(aug_cfg, "scale_min", 1.0))
+            scale_max = float(getattr(aug_cfg, "scale_max", 1.0))
+            rotate = int(getattr(aug_cfg, "rotate", 0))
+            blur_p = float(getattr(aug_cfg, "blur", 0.0))
+            cutout_n = int(getattr(aug_cfg, "cutout", 0))
+
+            augs = []
+            if hflip_p > 0:
+                augs.append(A.HorizontalFlip(p=hflip_p))
+            if brightness > 0 or contrast > 0:
+                augs.append(A.RandomBrightnessContrast(
+                    brightness_limit=brightness,
+                    contrast_limit=contrast,
+                    p=0.75,
+                ))
+            if hue > 0 or saturation > 0:
+                # HSV shift: convert hue fraction ~ degrees * 180? We'll approximate.
+                augs.append(A.HueSaturationValue(
+                    hue_shift_limit=int(hue * 180),
+                    sat_shift_limit=int(saturation * 255),
+                    val_shift_limit=0,
+                    p=0.5,
+                ))
+            if (scale_min != 1.0 or scale_max != 1.0) or rotate > 0:
+                augs.append(A.ShiftScaleRotate(
+                    shift_limit=0.02,
+                    scale_limit=max(scale_max - 1.0, 1.0 - scale_min),
+                    rotate_limit=rotate,
+                    border_mode=0,
+                    p=0.7,
+                ))
+            if blur_p > 0:
+                augs.append(A.Blur(blur_limit=3, p=blur_p))
+            if cutout_n > 0:
+                augs.append(A.Cutout(num_holes=cutout_n, max_w=imgsz // 10, max_h=imgsz // 10, fill_value=0, p=0.5))
+            if not augs:
+                return None
+            transform = A.Compose(
+                augs,
+                bbox_params=A.BboxParams(format="coco", label_fields=["category_id"], min_visibility=0.1),
+            )
+
+            def _apply(pil_img: Image.Image, anns: List[Dict[str, Any]]):
+                if not anns:
+                    # still apply geometric transforms
+                    res = transform(image=np.array(pil_img), bboxes=[], category_id=[])
+                    out_img = Image.fromarray(res["image"])  # type: ignore[index]
+                    return out_img, []
+                # Prepare lists
+                bboxes = []
+                labels = []
+                for a in anns:
+                    bb = a.get("bbox")
+                    cid = a.get("category_id", 0)
+                    if bb and len(bb) == 4:
+                        bboxes.append(bb)
+                        labels.append(cid)
+                import numpy as np  # local import for speed on module load
+                res = transform(image=np.array(pil_img), bboxes=bboxes, category_id=labels)
+                out_img = Image.fromarray(res["image"])  # type: ignore[index]
+                new_anns: List[Dict[str, Any]] = []
+                for bb, cid in zip(res.get("bboxes", []), res.get("category_id", [])):
+                    if not isinstance(bb, (list, tuple)) or len(bb) != 4:
+                        continue
+                    x, y, w, h = bb
+                    new_anns.append({"bbox": [x, y, w, h], "category_id": int(cid), "area": w * h, "iscrowd": 0})
+                return out_img, new_anns
+
+            return _apply
+
+        train_loader, val_loader, class_names = self._prepare_dataloaders(data, imgsz, batch, aug_builder=_build_aug)
 
         # Optimizer & scheduler
         wd = (extra or {}).get("weight_decay", 1e-4)
@@ -670,7 +748,6 @@ class TransformersDeformableDetrBackend:
         metrics = {"val_loss": avg_loss, "samples": preds_collected}
         if vis_max > 0:
             metrics["visualizations"] = saved_images
-            metrics["vis_dir"] = str(vis_dir)
         (out_dir / "val_metrics.json").write_text(json.dumps(metrics, indent=2))
         try:
             extra_vis = f" visualizations={saved_images} -> {vis_dir}" if vis_max > 0 else ""

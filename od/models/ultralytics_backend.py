@@ -39,6 +39,14 @@ class UltralyticsBackend:
             resume=resume,
         )
         if extra:
+            # Extract augmentation config if provided
+            aug_cfg = extra.pop("augmentation", None)
+            if aug_cfg and getattr(aug_cfg, "enable", False):  # dataclass-like
+                ultra_args = getattr(aug_cfg, "ultralytics", {}) or {}
+                # Don't overwrite explicitly set args
+                for k, v in ultra_args.items():
+                    args.setdefault(k, v)
+            # Remaining extras (user overrides)
             args.update(extra)
         return self.model.train(**args)
 

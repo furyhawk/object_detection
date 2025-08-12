@@ -63,6 +63,31 @@ class ValConfig:
 
 
 @dataclass
+class AugmentationConfig:
+        """Augmentation settings for training.
+
+        Generic structure so both backends can consume:
+            - enable: master switch
+            - ultralytics: dict of args forwarded directly to YOLO (e.g. mosaic=0.5, mixup=0.1)
+            - basic params used by transformers backend to build an Albumentations pipeline.
+        """
+        enable: bool = True
+        # Passed straight through to Ultralytics' train() (if backend == ultralytics)
+        ultralytics: Dict[str, Any] = field(default_factory=dict)
+        # Transformers backend simple knobs (probabilities / magnitudes)
+        hflip: float = 0.5          # horizontal flip probability
+        brightness: float = 0.2     # max delta for RandomBrightnessContrast (brightness_limit)
+        contrast: float = 0.2       # contrast_limit
+        hue: float = 0.02           # HSV hue shift fraction (approx)
+        saturation: float = 0.2     # saturation shift fraction
+        scale_min: float = 0.9      # random scale min (affine)
+        scale_max: float = 1.1      # random scale max
+        rotate: int = 0             # max absolute rotation degrees (0 disables)
+        blur: float = 0.0           # probability of applying a small blur
+        cutout: int = 0             # number of cutout holes (0 disables)
+
+
+@dataclass
 class Config:
     roboflow: RoboflowConfig = field(default_factory=RoboflowConfig)
     cvat: CvatConfig = field(default_factory=CvatConfig)
@@ -70,6 +95,7 @@ class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     val: ValConfig = field(default_factory=ValConfig)
+    augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
 
     @staticmethod
     def load(path: str | None = None, overrides: Optional[Dict[str, Any]] = None) -> "Config":

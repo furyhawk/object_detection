@@ -64,7 +64,7 @@ def run_train(cfg: Config, overrides: Optional[Dict[str, Any]] = None) -> Any:
     backend = _select_backend(cfg.model.backend, cfg.model.arch, cfg.model.device)
 
     return backend.train(
-    data=str(data_yaml),
+        data=str(data_yaml),
         project=cfg.train.project_dir,
         name=cfg.train.name,
         imgsz=cfg.model.imgsz,
@@ -73,7 +73,11 @@ def run_train(cfg: Config, overrides: Optional[Dict[str, Any]] = None) -> Any:
         lr=cfg.model.lr,
         seed=cfg.model.seed,
         resume=cfg.train.resume,
-        extra=overrides,
+        extra={
+            **(overrides or {}),
+            # Provide augmentation sub-dict for backends to interpret
+            "augmentation": getattr(cfg, "augmentation", None),
+        },
     )
 
 
