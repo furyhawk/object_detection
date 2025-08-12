@@ -112,7 +112,6 @@ venv.bak/
 .mypy_cache/
 
 # Other likely dirs that should not be committed
-data/
 model/
 
 # Polyaxon
@@ -142,3 +141,7 @@ __MACOSX/
 
 data/
 runs/
+
+# Do not ignore the library data module under od/
+!od/data/
+# !od/data/**
