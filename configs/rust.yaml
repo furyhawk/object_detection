@@ -11,10 +11,10 @@ roboflow:
 
 model:
   backend: ultralytics       # only 'ultralytics' supported for now
-  arch: yolov8n.pt           # model name or path to checkpoint
+  arch: yolov8m.pt           # model name or path to checkpoint
   imgsz: 640
-  lr: 0.00005
-  epochs: 20
+  lr: 0.00007
+  epochs: 30
   batch: 16
   device: null               # e.g. "cuda:0" or [0,1]
   seed: 42

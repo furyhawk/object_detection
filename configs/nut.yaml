@@ -2,31 +2,31 @@
 roboflow:
   # api_key: null            # optional; will read from ROBOFLOW_API_KEY if null
   workspace: test-0dgvp
-  project: bolt-defect-8zbeo
+  project: nut-and-bolt-rfjci-ucvbj
   version: 1
   split: yolov8              # export format; 'yolov8' recommended
   format: null               # override export format if needed
-  location: ./data/bolt defect.v1i.yolov8           # where to store dataset
+  location: ./data/Nut and bolt.v1i.yolov8           # where to store dataset
   # data_yaml: ./data/data.yaml
 
 model:
   backend: ultralytics       # only 'ultralytics' supported for now
-  arch: yolov8l.pt           # model name or path to checkpoint
+  arch: yolov8m.pt           # model name or path to checkpoint
   imgsz: 640
   lr: 0.00008
-  epochs: 20
+  epochs: 100
   batch: 16
   device: null               # e.g. "cuda:0" or [0,1]
   seed: 42
 
 train:
   project_dir: runs/train
-  name: expbolt
+  name: expnut
   resume: false
 
 val:
   project_dir: runs/val
-  name: expbolt
+  name: expnut
 
 augmentation:
   enable: true
@@ -43,7 +43,7 @@ augmentation:
   contrast: 0.2
   hue: 0.02
   saturation: 0.2
-  scale_min: 0.9
+  scale_min: 0.08
   scale_max: 1.1
   rotate: 5      # set >0 to enable random rotation
   blur: 0.0
