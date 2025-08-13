@@ -593,12 +593,28 @@ class TransformersDeformableDetrBackend:
                 map_vals: Dict[str, float] = {}
                 if map_metric is not None:
                     try:
-                        computed = {k: float(v) for k, v in map_metric.compute().items()}  # type: ignore[assignment]
-                        # Standard keys: map, map_50, map_75
+                        res = map_metric.compute()
+                        def _grab(key: str) -> float:
+                            v = res.get(key)
+                            if v is None:
+                                return float('nan')
+                            try:
+                                if isinstance(v, torch.Tensor):
+                                    if v.ndim == 0:
+                                        return float(v.item())
+                                    if v.numel() > 0:
+                                        return float(v.mean().item())
+                                    return float('nan')
+                            except Exception:  # pragma: no cover
+                                pass
+                            try:
+                                return float(v)  # type: ignore[arg-type]
+                            except Exception:
+                                return float('nan')
                         map_vals = {
-                            "map": computed.get("map", float("nan")),
-                            "map50": computed.get("map_50", float("nan")),
-                            "map75": computed.get("map_75", float("nan")),
+                            "map": _grab("map"),
+                            "map50": _grab("map_50"),
+                            "map75": _grab("map_75"),
                         }
                     except Exception as ce:  # pragma: no cover
                         print(f"[WARN] mAP compute failed: {ce}")
@@ -688,6 +704,17 @@ class TransformersDeformableDetrBackend:
         saved_images = 0
         mean = getattr(self.image_processor, "image_mean", [0.0, 0.0, 0.0])
         std = getattr(self.image_processor, "image_std", [1.0, 1.0, 1.0])
+        # Setup mAP metric (map, map50, map75) if available
+        map_metric = None
+        if MeanAveragePrecision is not None:
+            try:
+                map_metric = MeanAveragePrecision()
+            except Exception as e:  # pragma: no cover
+                try:
+                    print(f"[WARN] Could not initialize MeanAveragePrecision for validation: {e}")
+                except Exception:
+                    pass
+                map_metric = None
         with torch.no_grad():
             for batch_inputs in val_loader:
                 batch_inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch_inputs.items()}
@@ -703,6 +730,71 @@ class TransformersDeformableDetrBackend:
                 outputs = self.model(**batch_inputs)
                 losses.append(outputs.loss.item())
                 preds_collected += batch_inputs["pixel_values"].shape[0]
+
+                # mAP metric update
+                if map_metric is not None:
+                    try:
+                        logits = getattr(outputs, "logits", None)
+                        pred_boxes = getattr(outputs, "pred_boxes", None)
+                        if logits is not None and pred_boxes is not None:
+                            probs = logits.softmax(-1)[..., :-1]  # drop background
+                            scores, labels_pred = probs.max(-1)
+                            boxes_cxcywh = pred_boxes  # (B, Q, 4) normalized
+                            cx, cy, w_, h_ = boxes_cxcywh.unbind(-1)
+                            x1 = (cx - 0.5 * w_) * imgsz
+                            y1 = (cy - 0.5 * h_) * imgsz
+                            x2 = (cx + 0.5 * w_) * imgsz
+                            y2 = (cy + 0.5 * h_) * imgsz
+                            boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=-1).clamp(min=0, max=imgsz)
+                            B, Q = scores.shape
+                            batch_preds = []
+                            for bi in range(B):
+                                sc = scores[bi]
+                                lb = labels_pred[bi]
+                                bx = boxes_xyxy[bi]
+                                keep = sc > score_thresh
+                                if keep.any():
+                                    batch_preds.append({
+                                        "boxes": bx[keep].detach().cpu(),
+                                        "scores": sc[keep].detach().cpu(),
+                                        "labels": lb[keep].detach().cpu(),
+                                    })
+                                else:
+                                    batch_preds.append({
+                                        "boxes": torch.zeros((0, 4)),
+                                        "scores": torch.zeros((0,)),
+                                        "labels": torch.zeros((0,), dtype=torch.long),
+                                    })
+                            # Targets
+                            tgt_list = []
+                            targets = batch_inputs.get("labels") if isinstance(batch_inputs, dict) else None
+                            if isinstance(targets, list):
+                                for t in targets:
+                                    if not isinstance(t, dict):
+                                        tgt_list.append({"boxes": torch.zeros((0, 4)), "labels": torch.zeros((0,), dtype=torch.long)})
+                                        continue
+                                    tb = t.get("boxes")
+                                    tl = t.get("class_labels")
+                                    if isinstance(tb, torch.Tensor) and isinstance(tl, torch.Tensor):
+                                        if tb.numel():
+                                            cx_t, cy_t, w_t, h_t = tb.unbind(-1)
+                                            x1_t = (cx_t - 0.5 * w_t) * imgsz
+                                            y1_t = (cy_t - 0.5 * h_t) * imgsz
+                                            x2_t = (cx_t + 0.5 * w_t) * imgsz
+                                            y2_t = (cy_t + 0.5 * h_t) * imgsz
+                                            boxes_t = torch.stack([x1_t, y1_t, x2_t, y2_t], dim=-1)
+                                        else:
+                                            boxes_t = torch.zeros((0, 4))
+                                        tgt_list.append({"boxes": boxes_t.detach().cpu(), "labels": tl.detach().cpu()})
+                                    else:
+                                        tgt_list.append({"boxes": torch.zeros((0, 4)), "labels": torch.zeros((0,), dtype=torch.long)})
+                            if tgt_list:
+                                map_metric.update(batch_preds, tgt_list)  # type: ignore[arg-type]
+                    except Exception as me:  # pragma: no cover
+                        try:
+                            print(f"[WARN] validation mAP metric update failed: {me}")
+                        except Exception:
+                            pass
 
                 # Visualization logic (pred vs ground truth)
                 if vis_max > 0 and saved_images < vis_max:
@@ -784,13 +876,47 @@ class TransformersDeformableDetrBackend:
                         except Exception:
                             pass
         avg_loss = sum(losses) / max(1, len(losses))
-        metrics = {"val_loss": avg_loss, "samples": preds_collected}
+        map_vals: Dict[str, float] = {}
+        if map_metric is not None:
+            try:
+                res = map_metric.compute()
+                def _grab(key: str) -> float:
+                    v = res.get(key)
+                    if v is None:
+                        return float('nan')
+                    try:
+                        if isinstance(v, torch.Tensor):
+                            if v.ndim == 0:
+                                return float(v.item())
+                            if v.numel() > 0:
+                                return float(v.mean().item())
+                            return float('nan')
+                    except Exception:  # pragma: no cover
+                        pass
+                    try:
+                        return float(v)  # type: ignore[arg-type]
+                    except Exception:
+                        return float('nan')
+                map_vals = {
+                    "map": _grab("map"),
+                    "map50": _grab("map_50"),
+                    "map75": _grab("map_75"),
+                }
+            except Exception as ce:  # pragma: no cover
+                try:
+                    print(f"[WARN] validation mAP compute failed: {ce}")
+                except Exception:
+                    pass
+        metrics = {"val_loss": avg_loss, "samples": preds_collected, **map_vals}
         if vis_max > 0:
             metrics["visualizations"] = saved_images
         (out_dir / "val_metrics.json").write_text(json.dumps(metrics, indent=2))
         try:
             extra_vis = f" visualizations={saved_images} -> {vis_dir}" if vis_max > 0 else ""
-            print(f"[INFO] Validation finished. samples={preds_collected} val_loss={avg_loss:.4f}{extra_vis} -> {out_dir}/val_metrics.json")
+            map_msg = ""
+            if "map" in metrics:
+                map_msg = f" map={metrics.get('map', float('nan')):.4f} map50={metrics.get('map50', float('nan')):.4f} map75={metrics.get('map75', float('nan')):.4f}"
+            print(f"[INFO] Validation finished. samples={preds_collected} val_loss={avg_loss:.4f}{map_msg}{extra_vis} -> {out_dir}/val_metrics.json")
         except Exception:
             pass
         return metrics
