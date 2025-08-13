@@ -78,6 +78,8 @@ def run_train(cfg: Config, overrides: Optional[Dict[str, Any]] = None) -> Any:
             **(overrides or {}),
             # Provide augmentation sub-dict for backends to interpret
             "augmentation": getattr(cfg, "augmentation", None),
+            # unify threshold key for transformers backend (train epoch mAP filtering)
+            "val_score_thresh": getattr(cfg.model, "pred_score_thresh", 0.25),
         },
     )
 
@@ -321,5 +323,8 @@ def run_validate(cfg: Config, overrides: Optional[Dict[str, Any]] = None) -> Any
         imgsz=cfg.model.imgsz,
         batch=cfg.model.batch,
         seed=cfg.model.seed,
-        extra=overrides,
+        extra={
+            **(overrides or {}),
+            "val_score_thresh": getattr(cfg.model, "pred_score_thresh", 0.25),
+        },
     )

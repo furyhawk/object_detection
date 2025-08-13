@@ -47,6 +47,10 @@ class ModelConfig:
     # Examples: "cpu", "cuda:0", "0,1" (Ultralytics accepts GPU indices as comma-separated string)
     device: str | None = None
     seed: int = 42
+    # Minimum prediction confidence (score) to retain detections during validation / visualization
+    # Used primarily by the transformers backend (Deformable DETR). Can be overridden via CLI override:
+    #   -o val_score_thresh=0.5
+    pred_score_thresh: float = 0.25
 
 
 @dataclass
