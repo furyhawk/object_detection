@@ -60,18 +60,44 @@ class YOLODetectionDataset(Dataset):
             raise KeyError(f"Split '{split}' not present in data yaml")
         entry = yroot[key]
         paths: List[Path] = []
+
+        def _resolve_path(raw: str) -> Path:
+            """Resolve raw path strings that may contain incorrect '../' segments.
+
+            Roboflow exports sometimes emit entries like '../train/images' even when
+            'train/images' is correct relative to the data.yaml directory. We try a few
+            progressively sanitized interpretations before failing.
+            """
+            p = Path(raw)
+            # If already absolute and exists, return
+            if p.is_absolute() and p.exists():
+                return p
+            # First attempt: relative to data.yaml parent (normal case)
+            cand = (data_yaml.parent / raw).resolve()
+            if cand.exists():
+                return cand
+            # If it starts with one or more '../', strip them and try within the dataset dir
+            if raw.startswith("../"):
+                parts = [seg for seg in raw.split("/") if seg and seg != ".."]
+                if parts:
+                    cand2 = (data_yaml.parent / Path(*parts)).resolve()
+                    if cand2.exists():
+                        return cand2
+            # Final fallback: return original Path (will likely fail later)
+            return p
+
         if isinstance(entry, str):
-            p = Path(entry)
+            p = _resolve_path(entry)
             if p.suffix.lower() == ".txt" and p.exists():
                 with p.open() as f:
-                    paths = [Path(l.strip()) for l in f if l.strip()]
+                    paths = [(_resolve_path(l.strip()) if not Path(l.strip()).is_absolute() else Path(l.strip())) for l in f if l.strip()]
             elif p.is_dir():
                 paths = [pp for pp in p.rglob("*") if pp.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}]
             else:
                 raise FileNotFoundError(f"Split path not found: {p}")
         elif isinstance(entry, list):
             for e in entry:
-                ep = Path(e)
+                ep = _resolve_path(e)
                 if ep.is_dir():
                     paths.extend([pp for pp in ep.rglob("*") if pp.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}])
                 else:
@@ -266,6 +292,7 @@ class TransformersDeformableDetrBackend:
                 return None
             try:
                 import albumentations as A  # type: ignore
+                import numpy as np  # ensure available for inner closure
             except Exception:
                 print("[WARN] Albumentations not installed; skipping augmentations.")
                 return None
@@ -318,28 +345,40 @@ class TransformersDeformableDetrBackend:
             )
 
             def _apply(pil_img: Image.Image, anns: List[Dict[str, Any]]):
-                if not anns:
-                    # still apply geometric transforms
-                    res = transform(image=np.array(pil_img), bboxes=[], category_id=[])
-                    out_img = Image.fromarray(res["image"])  # type: ignore[index]
-                    return out_img, []
-                # Prepare lists
-                bboxes = []
+                W, H = pil_img.size
+                # Convert possibly out-of-range bboxes to safe COCO (x,y,w,h) within image bounds
+                safe_bboxes = []
                 labels = []
                 for a in anns:
                     bb = a.get("bbox")
                     cid = a.get("category_id", 0)
-                    if bb and len(bb) == 4:
-                        bboxes.append(bb)
-                        labels.append(cid)
-                import numpy as np  # local import for speed on module load
-                res = transform(image=np.array(pil_img), bboxes=bboxes, category_id=labels)
+                    if not bb or len(bb) != 4:
+                        continue
+                    x, y, w, h = bb
+                    # Clamp extents
+                    x = max(0.0, min(float(x), W - 1))
+                    y = max(0.0, min(float(y), H - 1))
+                    w = max(1.0, min(float(w), W - x))
+                    h = max(1.0, min(float(h), H - y))
+                    # Normalize to relative if values look normalized (>0 and <=1) and image is large? Actually export already absolute; keep as is.
+                    safe_bboxes.append([x, y, w, h])
+                    labels.append(cid)
+                if not safe_bboxes:
+                    res = transform(image=np.array(pil_img), bboxes=[], category_id=[])
+                    out_img = Image.fromarray(res["image"])  # type: ignore[index]
+                    return out_img, []
+                res = transform(image=np.array(pil_img), bboxes=safe_bboxes, category_id=labels)
                 out_img = Image.fromarray(res["image"])  # type: ignore[index]
                 new_anns: List[Dict[str, Any]] = []
                 for bb, cid in zip(res.get("bboxes", []), res.get("category_id", [])):
                     if not isinstance(bb, (list, tuple)) or len(bb) != 4:
                         continue
                     x, y, w, h = bb
+                    # Ensure still within bounds after transform
+                    x = max(0.0, min(float(x), out_img.width - 1))
+                    y = max(0.0, min(float(y), out_img.height - 1))
+                    w = max(1.0, min(float(w), out_img.width - x))
+                    h = max(1.0, min(float(h), out_img.height - y))
                     new_anns.append({"bbox": [x, y, w, h], "category_id": int(cid), "area": w * h, "iscrowd": 0})
                 return out_img, new_anns
 

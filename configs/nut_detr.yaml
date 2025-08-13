@@ -10,23 +10,23 @@ roboflow:
   # data_yaml: ./data/data.yaml
 
 model:
-  backend: ultralytics       # only 'ultralytics' supported for now
-  arch: yolov8m.pt           # model name or path to checkpoint
+  backend: transformers       # ultralytics | transformers
+  arch: SenseTime/deformable-detr-with-box-refine           # yolov8n.pt or SenseTime/deformable-detr-with-box-refine when backend=transformers
   imgsz: 640
   lr: 0.00008
-  epochs: 100
-  batch: 16
+  epochs: 20
+  batch: 4
   device: null               # e.g. "cuda:0" or [0,1]
   seed: 42
 
 train:
   project_dir: runs/train
-  name: expnut
+  name: expnut_detr
   resume: false
 
 val:
   project_dir: runs/val
-  name: expnut
+  name: expnut_detr
 
 augmentation:
   enable: true
