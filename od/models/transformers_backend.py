@@ -468,16 +468,47 @@ class TransformersDeformableDetrBackend:
             except Exception as e:  # pragma: no cover
                 print(f"[WARN] Could not initialize MeanAveragePrecision: {e}")
                 map_metric = None
-
+        # Inference / metric options (used for validation within training loop)
         score_thresh = float((extra or {}).get("val_score_thresh", 0.05))
+        with_nms: bool = bool((extra or {}).get("with_nms", False))
+        nms_iou: float = float((extra or {}).get("nms_iou", 0.5))
+        nms_class_agnostic: bool = bool((extra or {}).get("nms_class_agnostic", True))
 
+        def _box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+            area1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0) * (boxes1[:, 3] - boxes1[:, 1]).clamp(min=0)
+            area2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0) * (boxes2[:, 3] - boxes2[:, 1]).clamp(min=0)
+            lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])
+            rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])
+            wh = (rb - lt).clamp(min=0)
+            inter = wh[..., 0] * wh[..., 1]
+            union = area1[:, None] + area2 - inter
+            return inter / union.clamp(min=1e-6)
+
+        def _nms(boxes: torch.Tensor, scores: torch.Tensor, iou_thresh: float) -> torch.Tensor:
+            if boxes.numel() == 0:
+                return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+            try:  # pragma: no cover
+                from torchvision.ops import nms as tv_nms  # type: ignore
+                return tv_nms(boxes, scores, iou_thresh)
+            except Exception:
+                pass
+            keep: List[int] = []
+            idxs = scores.argsort(descending=True)
+            while idxs.numel() > 0:
+                i = int(idxs[0])
+                keep.append(i)
+                if idxs.numel() == 1:
+                    break
+                ious = _box_iou(boxes[i].unsqueeze(0), boxes[idxs[1:]])[0]
+                idxs = idxs[1:][ious <= iou_thresh]
+            return torch.tensor(keep, device=boxes.device, dtype=torch.long)
+
+        # ------------------ EPOCH LOOP ------------------
         for epoch in range(epochs):
             epoch_loss = 0.0
             for batch_idx, batch_inputs in enumerate(train_loader):
-                # Move tensors (including labels) onto target device
                 move_labels_inplace(batch_inputs)
                 if epoch == 0 and batch_idx == 0:
-                    # One-time verbose debug for first epoch / each batch
                     try:
                         label_list = batch_inputs.get("labels") if isinstance(batch_inputs, dict) else None
                     except Exception:
@@ -511,7 +542,7 @@ class TransformersDeformableDetrBackend:
                 epoch_loss += loss.item()
             avg_loss = epoch_loss / max(1, len(train_loader))
 
-            # Validation: compute loss and (optionally) detection metrics (mAP)
+            # ----- Validation phase per epoch -----
             self.model.eval()
             with torch.no_grad():
                 val_loss = 0.0
@@ -521,34 +552,54 @@ class TransformersDeformableDetrBackend:
                     move_labels_inplace(batch_inputs)
                     outputs = self.model(**batch_inputs)  # type: ignore[arg-type]
                     val_loss += outputs.loss.item()
-
                     if map_metric is not None:
                         try:
-                            # Extract predictions
                             logits = getattr(outputs, "logits", None)
                             pred_boxes = getattr(outputs, "pred_boxes", None)
                             if logits is None or pred_boxes is None:
                                 continue
-                            probs = logits.softmax(-1)[..., :-1]  # drop background
-                            scores, labels_pred = probs.max(-1)
-                            boxes_cxcywh = pred_boxes  # normalized cxcywh in 0..1
-                            # Convert to xyxy absolute (after resize all imgs are imgsz x imgsz)
+                            probs = logits.softmax(-1)[..., :-1]
+                            scores_all, labels_pred = probs.max(-1)
+                            boxes_cxcywh = pred_boxes
                             cx, cy, w_, h_ = boxes_cxcywh.unbind(-1)
                             x1 = (cx - 0.5 * w_) * imgsz
                             y1 = (cy - 0.5 * h_) * imgsz
                             x2 = (cx + 0.5 * w_) * imgsz
                             y2 = (cy + 0.5 * h_) * imgsz
-                            boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=-1)
-                            # Clamp
-                            boxes_xyxy = boxes_xyxy.clamp(min=0, max=imgsz)
-
+                            boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=-1).clamp(min=0, max=imgsz)
+                            B, Q = scores_all.shape
                             batch_preds = []
-                            B, Q = scores.shape
                             for bi in range(B):
-                                sc = scores[bi]
+                                sc = scores_all[bi]
                                 lb = labels_pred[bi]
                                 bx = boxes_xyxy[bi]
                                 keep = sc > score_thresh
+                                if with_nms and keep.any():
+                                    if nms_class_agnostic:
+                                        sub_scores = sc[keep]
+                                        sub_boxes = bx[keep]
+                                        nms_keep_rel = _nms(sub_boxes, sub_scores, nms_iou)
+                                        keep_indices = torch.nonzero(keep, as_tuple=False).flatten()
+                                        keep_mask = torch.zeros_like(keep)
+                                        keep_mask[keep_indices[nms_keep_rel]] = True
+                                        keep = keep_mask
+                                    else:
+                                        train_keep_indices_total: List[int] = []
+                                        filtered_indices = torch.nonzero(keep, as_tuple=False).flatten()
+                                        flabels = lb[keep]
+                                        fboxes = bx[keep]
+                                        fscores = sc[keep]
+                                        for cls in flabels.unique():
+                                            cls_mask = flabels == cls
+                                            cls_boxes = fboxes[cls_mask]
+                                            cls_scores = fscores[cls_mask]
+                                            cls_keep_rel = _nms(cls_boxes, cls_scores, nms_iou)
+                                            orig_subset = filtered_indices[cls_mask]
+                                            train_keep_indices_total.extend(orig_subset[cls_keep_rel].tolist())
+                                        keep_mask = torch.zeros_like(keep)
+                                        if train_keep_indices_total:
+                                            keep_mask[torch.tensor(train_keep_indices_total, device=keep_mask.device)] = True
+                                        keep = keep_mask
                                 if keep.any():
                                     batch_preds.append({
                                         "boxes": bx[keep].detach().cpu(),
@@ -561,8 +612,7 @@ class TransformersDeformableDetrBackend:
                                         "scores": torch.zeros((0,)),
                                         "labels": torch.zeros((0,), dtype=torch.long),
                                     })
-
-                            # Targets: convert normalized cxcywh to xyxy absolute
+                            # Targets conversion
                             tgt_list = []
                             targets = batch_inputs.get("labels") if isinstance(batch_inputs, dict) else None
                             if isinstance(targets, list):
@@ -574,15 +624,15 @@ class TransformersDeformableDetrBackend:
                                     tl = t.get("class_labels")
                                     if isinstance(tb, torch.Tensor) and isinstance(tl, torch.Tensor):
                                         if tb.numel():
-                                            cx, cy, w_, h_ = tb.unbind(-1)
-                                            x1 = (cx - 0.5 * w_) * imgsz
-                                            y1 = (cy - 0.5 * h_) * imgsz
-                                            x2 = (cx + 0.5 * w_) * imgsz
-                                            y2 = (cy + 0.5 * h_) * imgsz
-                                            boxes = torch.stack([x1, y1, x2, y2], dim=-1)
+                                            cx_t, cy_t, w_t, h_t = tb.unbind(-1)
+                                            x1_t = (cx_t - 0.5 * w_t) * imgsz
+                                            y1_t = (cy_t - 0.5 * h_t) * imgsz
+                                            x2_t = (cx_t + 0.5 * w_t) * imgsz
+                                            y2_t = (cy_t + 0.5 * h_t) * imgsz
+                                            boxes_t = torch.stack([x1_t, y1_t, x2_t, y2_t], dim=-1)
                                         else:
-                                            boxes = torch.zeros((0, 4))
-                                        tgt_list.append({"boxes": boxes.detach().cpu(), "labels": tl.detach().cpu()})
+                                            boxes_t = torch.zeros((0, 4))
+                                        tgt_list.append({"boxes": boxes_t.detach().cpu(), "labels": tl.detach().cpu()})
                                     else:
                                         tgt_list.append({"boxes": torch.zeros((0, 4)), "labels": torch.zeros((0,), dtype=torch.long)})
                             if tgt_list:
@@ -605,40 +655,31 @@ class TransformersDeformableDetrBackend:
                                     if v.numel() > 0:
                                         return float(v.mean().item())
                                     return float('nan')
-                            except Exception:  # pragma: no cover
+                            except Exception:
                                 pass
                             try:
                                 return float(v)  # type: ignore[arg-type]
                             except Exception:
                                 return float('nan')
-                        map_vals = {
-                            "map": _grab("map"),
-                            "map50": _grab("map_50"),
-                            "map75": _grab("map_75"),
-                        }
+                        map_vals = {"map": _grab("map"), "map50": _grab("map_50"), "map75": _grab("map_75")}
                     except Exception as ce:  # pragma: no cover
                         print(f"[WARN] mAP compute failed: {ce}")
             self.model.train()
 
             metrics = {"epoch": epoch + 1, "train_loss": avg_loss, "val_loss": val_loss, **map_vals}
             history.append(metrics)
-            # Persist running log
             with (out_dir / "history.jsonl").open("a") as f:
                 f.write(json.dumps(metrics) + "\n")
-
-            # Console progress output (one line per epoch)
             try:
                 extra_msg = ""
                 if "map" in metrics:
                     m = metrics
                     extra_msg = f" map={m.get('map', float('nan')):.4f} map50={m.get('map50', float('nan')):.4f} map75={m.get('map75', float('nan')):.4f}"
-                print(
-                    f"[INFO] Epoch {epoch + 1}/{epochs} | train_loss={avg_loss:.4f} val_loss={val_loss:.4f}{extra_msg}"
-                )
+                print(f"[INFO] Epoch {epoch + 1}/{epochs} | train_loss={avg_loss:.4f} val_loss={val_loss:.4f}{extra_msg}")
             except Exception:
                 pass
 
-        # Save final model with fallbacks for shared tensor warning
+        # Save final model
         saved = False
         try:
             self.model.save_pretrained(out_dir)
@@ -652,7 +693,6 @@ class TransformersDeformableDetrBackend:
                 print("[WARN] save_pretrained safe_serialization=False failed, fallback to state_dict:", e2)
                 try:
                     torch.save(self.model.state_dict(), out_dir / "pytorch_model.bin")
-                    # minimal config
                     (out_dir / "config.json").write_text(json.dumps(self.model.config.to_dict(), indent=2))
                     saved = True
                 except Exception as e3:
@@ -697,6 +737,37 @@ class TransformersDeformableDetrBackend:
         # Visualization setup
         ex = extra or {}
         score_thresh = float(ex.get("val_score_thresh", 0.05))
+        with_nms: bool = bool(ex.get("with_nms", False))
+        nms_iou: float = float(ex.get("nms_iou", 0.5))
+        nms_class_agnostic: bool = bool(ex.get("nms_class_agnostic", True))
+        # Reuse simple NMS utilities (duplicated here to avoid coupling with train local scope)
+        def _box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+            area1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0) * (boxes1[:, 3] - boxes1[:, 1]).clamp(min=0)
+            area2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0) * (boxes2[:, 3] - boxes2[:, 1]).clamp(min=0)
+            lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])
+            rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])
+            wh = (rb - lt).clamp(min=0)
+            inter = wh[..., 0] * wh[..., 1]
+            union = area1[:, None] + area2 - inter
+            return inter / union.clamp(min=1e-6)
+        def _nms(boxes: torch.Tensor, scores: torch.Tensor, iou_thresh: float) -> torch.Tensor:
+            if boxes.numel() == 0:
+                return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+            try:  # pragma: no cover
+                from torchvision.ops import nms as tv_nms  # type: ignore
+                return tv_nms(boxes, scores, iou_thresh)
+            except Exception:
+                pass
+            keep: List[int] = []
+            idxs = scores.argsort(descending=True)
+            while idxs.numel() > 0:
+                i = int(idxs[0])
+                keep.append(i)
+                if idxs.numel() == 1:
+                    break
+                ious = _box_iou(boxes[i].unsqueeze(0), boxes[idxs[1:]])[0]
+                idxs = idxs[1:][ious <= iou_thresh]
+            return torch.tensor(keep, device=boxes.device, dtype=torch.long)
         vis_max = int(ex.get("val_vis_max", 20))  # number of validation images to dump (0 = disable)
         vis_dir = out_dir / "val_vis"
         if vis_max > 0:
@@ -753,6 +824,32 @@ class TransformersDeformableDetrBackend:
                                 lb = labels_pred[bi]
                                 bx = boxes_xyxy[bi]
                                 keep = sc > score_thresh
+                                if with_nms and keep.any():
+                                    if nms_class_agnostic:
+                                        sub_scores = sc[keep]
+                                        sub_boxes = bx[keep]
+                                        nms_keep_rel = _nms(sub_boxes, sub_scores, nms_iou)
+                                        keep_indices = torch.nonzero(keep, as_tuple=False).flatten()
+                                        keep_mask = torch.zeros_like(keep)
+                                        keep_mask[keep_indices[nms_keep_rel]] = True
+                                        keep = keep_mask
+                                    else:
+                                        keep_indices_total: List[int] = []
+                                        filtered_indices = torch.nonzero(keep, as_tuple=False).flatten()
+                                        flabels = lb[keep]
+                                        fboxes = bx[keep]
+                                        fscores = sc[keep]
+                                        for cls in flabels.unique():
+                                            cls_mask = flabels == cls
+                                            cls_boxes = fboxes[cls_mask]
+                                            cls_scores = fscores[cls_mask]
+                                            cls_keep_rel = _nms(cls_boxes, cls_scores, nms_iou)
+                                            orig_subset = filtered_indices[cls_mask]
+                                            keep_indices_total.extend(orig_subset[cls_keep_rel].tolist())
+                                        keep_mask = torch.zeros_like(keep)
+                                        if keep_indices_total:
+                                            keep_mask[torch.tensor(keep_indices_total, device=keep_mask.device)] = True
+                                        keep = keep_mask
                                 if keep.any():
                                     batch_preds.append({
                                         "boxes": bx[keep].detach().cpu(),
@@ -837,6 +934,32 @@ class TransformersDeformableDetrBackend:
                             lb = labels_pred[bi]
                             bx = boxes_xyxy[bi]
                             keep = sc > score_thresh
+                            if with_nms and keep.any():
+                                if nms_class_agnostic:
+                                    sub_scores = sc[keep]
+                                    sub_boxes = bx[keep]
+                                    nms_keep_rel = _nms(sub_boxes, sub_scores, nms_iou)
+                                    keep_indices = torch.nonzero(keep, as_tuple=False).flatten()
+                                    keep_mask = torch.zeros_like(keep)
+                                    keep_mask[keep_indices[nms_keep_rel]] = True
+                                    keep = keep_mask
+                                else:
+                                    vis_keep_indices_total: List[int] = []
+                                    filtered_indices = torch.nonzero(keep, as_tuple=False).flatten()
+                                    flabels = lb[keep]
+                                    fboxes = bx[keep]
+                                    fscores = sc[keep]
+                                    for cls in flabels.unique():
+                                        cls_mask = flabels == cls
+                                        cls_boxes = fboxes[cls_mask]
+                                        cls_scores = fscores[cls_mask]
+                                        cls_keep_rel = _nms(cls_boxes, cls_scores, nms_iou)
+                                        orig_subset = filtered_indices[cls_mask]
+                                        vis_keep_indices_total.extend(orig_subset[cls_keep_rel].tolist())
+                                    keep_mask = torch.zeros_like(keep)
+                                    if vis_keep_indices_total:
+                                        keep_mask[torch.tensor(vis_keep_indices_total, device=keep_mask.device)] = True
+                                    keep = keep_mask
                             for pj in torch.nonzero(keep, as_tuple=False).flatten().tolist():
                                 box = bx[pj].detach().cpu().tolist()
                                 cls_id = int(lb[pj].detach().cpu().item())

@@ -13,7 +13,7 @@ model:
   backend: ultralytics       # only 'ultralytics' supported for now
   arch: yolov8m.pt           # model name or path to checkpoint
   imgsz: 640
-  lr: 0.00008
+  lr: 0.00005
   epochs: 100
   batch: 16
   device: null               # e.g. "cuda:0" or [0,1]

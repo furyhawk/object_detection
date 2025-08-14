@@ -26,28 +26,28 @@ class UltralyticsBackend:
         resume: bool = False,
         extra: Optional[Dict[str, Any]] = None,
     ) -> Any:
-        args = dict(
-            data=str(data),
-            project=project,
-            name=name,
-            imgsz=imgsz,
-            epochs=epochs,
-            batch=batch,
-            lr0=lr,
-            seed=seed,
-            device=self.device,
-            resume=resume,
-        )
+        args: Dict[str, Any] = {
+            "data": str(data),
+            "project": project,
+            "name": name,
+            "imgsz": imgsz,
+            "epochs": epochs,
+            "batch": batch,
+            "lr0": lr,
+            "seed": seed,
+            "device": self.device,
+            "resume": resume,
+        }
         if extra:
             # Extract augmentation config if provided
             aug_cfg = extra.pop("augmentation", None)
             if aug_cfg and getattr(aug_cfg, "enable", False):  # dataclass-like
                 ultra_args = getattr(aug_cfg, "ultralytics", {}) or {}
-                # Don't overwrite explicitly set args
                 for k, v in ultra_args.items():
                     args.setdefault(k, v)
-            # Remaining extras (user overrides)
             args.update(extra)
+        # Remove keys not accepted by Ultralytics train API
+        args.pop("val_score_thresh", None)
         return self.model.train(**args)
 
     def validate(
@@ -60,17 +60,19 @@ class UltralyticsBackend:
         seed: int = 42,
         extra: Optional[Dict[str, Any]] = None,
     ) -> Any:
-        args = dict(
-            data=str(data),
-            project=project,
-            name=name,
-            imgsz=imgsz,
-            batch=batch,
-            seed=seed,
-            device=self.device,
-        )
+        args: Dict[str, Any] = {
+            "data": str(data),
+            "project": project,
+            "name": name,
+            "imgsz": imgsz,
+            "batch": batch,
+            "seed": seed,
+            "device": self.device,
+        }
         if extra:
             args.update(extra)
+        # Strip unsupported keys to avoid Ultralytics cfg alignment errors.
+        args.pop("val_score_thresh", None)
         return self.model.val(**args)
 
     def export(self, format: str = "onnx", **kwargs: Any) -> Any:

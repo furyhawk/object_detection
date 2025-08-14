@@ -29,6 +29,7 @@ model:
   batch: 16
   device: null               # e.g. "cuda:0" or [0,1]
   seed: 42
+  pred_score_thresh: 0.4     # only keep predictions with confidence >= this (transformers backend)
 
 train:
   project_dir: runs/train
