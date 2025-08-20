@@ -68,6 +68,17 @@ def run_train(cfg: Config, overrides: Optional[Dict[str, Any]] = None) -> Any:
 
     backend = _select_backend(cfg.model.backend, cfg.model.arch, cfg.model.device)
 
+    # Model-specific overrides for transformers backends (e.g., RT-DETR)
+    model_overrides: Dict[str, Any] = {}
+    try:
+        if (cfg.model.backend or "").lower() == "transformers":
+            arch_l = (cfg.model.arch or "").lower()
+            if "rtdetr" in arch_l:
+                # Per HF RT-DETR docs, disable anchors in detection head when re-initializing
+                model_overrides["anchor_image_size"] = None
+    except Exception:
+        pass
+
     return backend.train(
         data=str(data_yaml),
         project=cfg.train.project_dir,
@@ -84,6 +95,8 @@ def run_train(cfg: Config, overrides: Optional[Dict[str, Any]] = None) -> Any:
             "augmentation": getattr(cfg, "augmentation", None),
             # unify threshold key for transformers backend (train epoch mAP filtering)
             "val_score_thresh": getattr(cfg.model, "pred_score_thresh", 0.25),
+            # backend-specific model overrides (consumed by transformers backend)
+            "model_overrides": model_overrides,
         },
     )
 

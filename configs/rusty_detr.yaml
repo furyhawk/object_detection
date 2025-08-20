@@ -3,10 +3,10 @@ roboflow:
   # api_key: null            # optional; will read from ROBOFLOW_API_KEY if null
   workspace: test-0dgvp
   project: rusty-ukssy
-  version: 2
+  version: 4
   split: yolov8              # export format; 'yolov8' recommended
   format: null               # override export format if needed
-  location: ./data/rusty.v2i.yolov8           # where to store dataset
+  location: ./data/rusty.v4i.yolov8           # where to store dataset
   # data_yaml: ./data/data.yaml
 
 model:
