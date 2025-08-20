@@ -1,0 +1,50 @@
+# Example configuration for training/validation with Roboflow + Ultralytics
+roboflow:
+  # api_key: null            # optional; will read from ROBOFLOW_API_KEY if null
+  workspace: test-0dgvp
+  project: rusty-ukssy
+  version: 2
+  split: yolov8              # export format; 'yolov8' recommended
+  format: null               # override export format if needed
+  location: ./data/rusty.v2i.yolov8           # where to store dataset
+  # data_yaml: ./data/data.yaml
+
+model:
+  backend: torchvision       # only 'ultralytics' supported for now
+  arch: retinanet_resnet50_fpn           # model name or path to checkpoint
+  imgsz: 640
+  lr: 0.00005
+  epochs: 10
+  batch: 8
+  device: null               # e.g. "cuda:0" or [0,1]
+  seed: 42
+
+train:
+  project_dir: runs/train
+  name: exp_rusty
+  resume: false
+
+val:
+  project_dir: runs/val
+  name: exp_rusty
+
+augmentation:
+  enable: true
+  # Settings for Ultralytics backend (forwarded directly). Uncomment / edit as needed.
+  # ultralytics:
+  #   mosaic: 0.5
+  #   mixup: 0.1
+  #   hsv_h: 0.015
+  #   hsv_s: 0.7
+  #   hsv_v: 0.4
+  # Basic generic knobs (used by transformers backend via Albumentations pipeline)
+  hflip: 0.5
+  brightness: 0.2
+  contrast: 0.2
+  hue: 0.02
+  saturation: 0.2
+  scale_min: 0.9
+  scale_max: 1.1
+  rotate: 5      # set >0 to enable random rotation
+  blur: 0.0
+  cutout: 0
