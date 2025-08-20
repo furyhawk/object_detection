@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 from od.utils.config import Config
 from od.data import ensure_roboflow_dataset, find_data_yaml
 import importlib
-from od.models import UltralyticsBackend, TransformersDeformableDetrBackend, TorchvisionRetinaNetBackend
+from od.models import UltralyticsBackend, TransformersDeformableDetrBackend, TorchvisionRetinaNetBackend, TransformersYolosBackend
 import os
 
 
@@ -15,6 +15,8 @@ def _select_backend(name: str, arch: str, device: Optional[str]):
         return UltralyticsBackend(arch=arch, device=device)
     if name.lower() == "transformers":
         return TransformersDeformableDetrBackend(arch=arch, device=device)
+    if name.lower() in {"yolos", "transformers-yolos", "transformers_yolos"}:
+        return TransformersYolosBackend(arch=arch or "hustvl/yolos-small-dwr", device=device)
     if name.lower() in {"torchvision", "retinanet"}:
         return TorchvisionRetinaNetBackend(arch=arch, device=device)
     raise NotImplementedError(f"Backend '{name}' is not supported yet")

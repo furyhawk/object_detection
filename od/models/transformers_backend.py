@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover - fallback path
 from transformers import (
     AutoImageProcessor,
     DeformableDetrForObjectDetection,
+    YolosForObjectDetection,
     get_cosine_schedule_with_warmup,
 )
 
@@ -201,12 +202,20 @@ class TransformersDeformableDetrBackend:
         if class_names:
             # Align model classifier if needed (resize num_classes inc background)
             num_classes = len(class_names)
-            if hasattr(self.model, "class_labels_classifier") and self.model.config.num_labels != num_classes:  # type: ignore[attr-defined]
-                # Adjust classifier output (add background token)
-                in_features = getattr(self.model.class_labels_classifier, "in_features", None)  # type: ignore[attr-defined]
-                if isinstance(in_features, int):
-                    self.model.class_labels_classifier = nn.Linear(in_features, num_classes + 1)  # type: ignore[assignment]
-                    self.model.config.num_labels = num_classes
+            try:
+                # Update config first
+                if getattr(self.model.config, "num_labels", None) != num_classes:  # type: ignore[union-attr]
+                    self.model.config.num_labels = num_classes  # type: ignore[union-attr]
+                # Try common classifier attr names across DETR-like models
+                for attr in ("class_labels_classifier", "class_predictor", "classifier"):
+                    if hasattr(self.model, attr):
+                        head = getattr(self.model, attr)
+                        in_features = getattr(head, "in_features", None)
+                        if isinstance(in_features, int):
+                            setattr(self.model, attr, nn.Linear(in_features, num_classes + 1))
+                            break
+            except Exception as _e:  # pragma: no cover
+                print(f"[WARN] Could not adapt classifier head to {num_classes} classes: {_e}")
 
         def collate(samples: List[_Sample]):
             images = [s.image for s in samples]
@@ -1047,3 +1056,20 @@ class TransformersDeformableDetrBackend:
     def export(self, format: str = "pt", **kwargs: Any) -> Any:  # noqa: D401
         """Export not fully implemented; returns path to saved directory."""
         return {"note": "Use model.save_pretrained(output_dir) after training.", **kwargs}
+
+
+class TransformersYolosBackend(TransformersDeformableDetrBackend):
+    """Backend that fine-tunes a YOLOS model (hustvl/yolos-small-dwr by default).
+
+    Uses the same training/validation loop as the Deformable DETR backend since
+    YOLOS follows the DETR-style API on Hugging Face (logits + pred_boxes, labels
+    as normalized cxcywh with class_labels).
+    """
+
+    def __init__(self, arch: str = "hustvl/yolos-small-dwr", device: Optional[str] = None):
+        self.arch = arch
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.image_processor = AutoImageProcessor.from_pretrained(arch)
+        model = YolosForObjectDetection.from_pretrained(arch)
+        model.to(self.device)  # type: ignore[arg-type]
+        self.model = model
