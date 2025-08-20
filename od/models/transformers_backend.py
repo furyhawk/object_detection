@@ -200,22 +200,67 @@ class TransformersDeformableDetrBackend:
 
         class_names = train_ds.class_names
         if class_names:
-            # Align model classifier if needed (resize num_classes inc background)
+            # Align model classifier and loss to dataset classes (num_classes + background)
             num_classes = len(class_names)
             try:
-                # Update config first
-                if getattr(self.model.config, "num_labels", None) != num_classes:  # type: ignore[union-attr]
-                    self.model.config.num_labels = num_classes  # type: ignore[union-attr]
-                # Try common classifier attr names across DETR-like models
-                for attr in ("class_labels_classifier", "class_predictor", "classifier"):
+                # --- Update config (num_labels, id2label/label2id) ---
+                cfg = self.model.config  # type: ignore[assignment]
+                try:
+                    if getattr(cfg, "num_labels", None) != num_classes:  # type: ignore[union-attr]
+                        cfg.num_labels = num_classes  # type: ignore[union-attr]
+                except Exception:
+                    pass
+                try:
+                    cfg.id2label = {int(i): str(n) for i, n in enumerate(class_names)}  # type: ignore[attr-defined]
+                    cfg.label2id = {str(n): int(i) for i, n in enumerate(class_names)}  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+
+                # --- Replace classifier head to match new class count (num_classes + background) ---
+                replaced = False
+                for attr in ("class_labels_classifier", "class_predictor", "classifier", "class_embed"):
                     if hasattr(self.model, attr):
                         head = getattr(self.model, attr)
                         in_features = getattr(head, "in_features", None)
                         if isinstance(in_features, int):
-                            setattr(self.model, attr, nn.Linear(in_features, num_classes + 1))
+                            # preserve dtype/device of old head
+                            old_weight = getattr(head, "weight", None)
+                            dtype = old_weight.dtype if hasattr(old_weight, "dtype") else None
+                            device = old_weight.device if hasattr(old_weight, "device") else self.device
+                            new_head = nn.Linear(in_features, num_classes + 1)
+                            if dtype is not None:
+                                new_head = new_head.to(dtype=dtype)
+                            try:
+                                new_head = new_head.to(device)  # move to same device as rest of model
+                            except Exception:
+                                pass
+                            setattr(self.model, attr, new_head)
+                            replaced = True
                             break
+                if not replaced:
+                    print("[WARN] Could not locate classifier head to adapt class count; proceeding anyway.")
+
+                # --- Sanity check: ensure config.num_labels matches logits.size(-1) - 1 ---
+                try:
+                    self.model.eval()
+                    with torch.no_grad():
+                        # Minimal dry-run with zeros to inspect output shape
+                        dummy = torch.zeros((1, 3, imgsz, imgsz), device=self.device)
+                        out = self.model(pixel_values=dummy)  # type: ignore[arg-type]
+                        logits = getattr(out, "logits", None)
+                        if isinstance(logits, torch.Tensor) and logits.ndim == 3:
+                            C = int(logits.shape[-1])
+                            if getattr(cfg, "num_labels", None) != C - 1:  # type: ignore[union-attr]
+                                try:
+                                    cfg.num_labels = C - 1  # type: ignore[union-attr]
+                                    print(f"[INFO] Adjusted config.num_labels to {cfg.num_labels} to match logits={C}.")
+                                except Exception:
+                                    pass
+                except Exception:
+                    # If dry-run fails (e.g., missing processor), skip this check
+                    pass
             except Exception as _e:  # pragma: no cover
-                print(f"[WARN] Could not adapt classifier head to {num_classes} classes: {_e}")
+                print(f"[WARN] Could not adapt classifier head/config to {num_classes} classes: {_e}")
 
         def collate(samples: List[_Sample]):
             images = [s.image for s in samples]
@@ -517,6 +562,39 @@ class TransformersDeformableDetrBackend:
             epoch_loss = 0.0
             for batch_idx, batch_inputs in enumerate(train_loader):
                 move_labels_inplace(batch_inputs)
+                # One-time adaptive resize of loss weights to match logits classes
+                if epoch == 0 and batch_idx == 0:
+                    try:
+                        # Build input without labels to infer class dimension cheaply
+                        infer_inputs = {k: v for k, v in batch_inputs.items() if k != "labels"}
+                        dry = self.model(**infer_inputs)  # type: ignore[arg-type]
+                        logits = getattr(dry, "logits", None)
+                        if isinstance(logits, torch.Tensor) and logits.ndim >= 3:
+                            C = int(logits.shape[-1])
+                            crit = getattr(self.model, "loss_function", None)
+                            if crit is not None and hasattr(crit, "empty_weight"):
+                                # Determine eos coef if present
+                                eos_coef = None
+                                for coef_name in ("eos_coef", "no_object_weight", "eos_weight"):
+                                    if hasattr(crit, coef_name):
+                                        eos_coef = float(getattr(crit, coef_name))
+                                        break
+                                if eos_coef is None:
+                                    eos_coef = 0.1
+                                new_w = torch.ones(C, device=self.device, dtype=torch.float32)
+                                new_w[-1] = float(eos_coef)
+                                ew = getattr(crit, "empty_weight")
+                                try:
+                                    if isinstance(ew, torch.nn.Parameter):
+                                        if ew.data.shape != new_w.shape:
+                                            ew.data = new_w  # type: ignore[assignment]
+                                    else:
+                                        if not isinstance(ew, torch.Tensor) or ew.shape != new_w.shape:
+                                            setattr(crit, "empty_weight", new_w)
+                                except Exception:
+                                    setattr(crit, "empty_weight", new_w)
+                    except Exception as _adp_e:  # pragma: no cover
+                        print(f"[WARN] train adaptive loss weight setup failed: {_adp_e}")
                 if epoch == 0 and batch_idx == 0:
                     try:
                         label_list = batch_inputs.get("labels") if isinstance(batch_inputs, dict) else None
@@ -798,6 +876,40 @@ class TransformersDeformableDetrBackend:
         with torch.no_grad():
             for batch_inputs in val_loader:
                 batch_inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch_inputs.items()}
+                # One-time adaptive resize of loss weights to match logits classes (validation)
+                if preds_collected == 0:
+                    try:
+                        infer_inputs = {k: v for k, v in batch_inputs.items() if k != "labels"}
+                        dry = self.model(**infer_inputs)
+                        logits = getattr(dry, "logits", None)
+                        if isinstance(logits, torch.Tensor) and logits.ndim >= 3:
+                            C = int(logits.shape[-1])
+                            crit = getattr(self.model, "loss_function", None)
+                            if crit is not None and hasattr(crit, "empty_weight"):
+                                eos_coef = None
+                                for coef_name in ("eos_coef", "no_object_weight", "eos_weight"):
+                                    if hasattr(crit, coef_name):
+                                        eos_coef = float(getattr(crit, coef_name))
+                                        break
+                                if eos_coef is None:
+                                    eos_coef = 0.1
+                                new_w = torch.ones(C, device=self.device, dtype=torch.float32)
+                                new_w[-1] = float(eos_coef)
+                                ew = getattr(crit, "empty_weight")
+                                try:
+                                    if isinstance(ew, torch.nn.Parameter):
+                                        if ew.data.shape != new_w.shape:
+                                            ew.data = new_w  # type: ignore[assignment]
+                                    else:
+                                        if not isinstance(ew, torch.Tensor) or ew.shape != new_w.shape:
+                                            setattr(crit, "empty_weight", new_w)
+                                except Exception:
+                                    setattr(crit, "empty_weight", new_w)
+                    except Exception as _adp2_e:  # pragma: no cover
+                        try:
+                            print(f"[WARN] val adaptive loss weight setup failed: {_adp2_e}")
+                        except Exception:
+                            pass
                 # labels is a list[dict]; move nested tensors
                 if isinstance(batch_inputs.get("labels"), list):  # type: ignore[truthy-bool]
                     moved_labels = []
