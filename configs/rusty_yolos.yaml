@@ -15,12 +15,12 @@ model:
   backend: yolos                         # new backend key added
   arch: hustvl/yolos-small-dwr           # default YOLOS model id
   imgsz: 640
-  lr: 0.00005                            # transformers-friendly LR
+  lr: 0.00007                            # transformers-friendly LR
   epochs: 20
-  batch: 2
+  batch: 4
   device: null                           # e.g. "cuda:0"
   seed: 42
-  pred_score_thresh: 0.6                 # filtering threshold for validation/vis
+  pred_score_thresh: 0.1                 # filtering threshold for validation/vis
 
 train:
   project_dir: runs/train

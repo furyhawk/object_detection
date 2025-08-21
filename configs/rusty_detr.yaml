@@ -13,12 +13,12 @@ model:
   backend: transformers       # ultralytics | transformers
   arch: SenseTime/deformable-detr-with-box-refine           # yolov8n.pt or SenseTime/deformable-detr-with-box-refine when backend=transformers
   imgsz: 640
-  lr: 0.00005
+  lr: 0.00007
   epochs: 20
   batch: 4
   device: null               # e.g. "cuda:0" or [0,1]
   seed: 42
-  pred_score_thresh: 0.6     # only keep predictions with confidence >= this (transformers backend)
+  pred_score_thresh: 0.1     # only keep predictions with confidence >= this (transformers backend)
 
 train:
   project_dir: runs/train

@@ -8,7 +8,6 @@ import warnings
 warnings.filterwarnings("ignore", message=r"for .*meta parameter")
 
 import torch
-from torch import nn
 import numpy as np  # for metrics/array handling
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image, ImageDraw
@@ -259,42 +258,118 @@ class TransformersDeformableDetrBackend:
                     pass
                 self._collate_debug_done = True  # type: ignore[attr-defined]
             # Always rebuild labels to ensure expected structure: boxes in cxcywh normalized [0,1]
-            labels_list = []
+            # IMPORTANT: rely on the image_processor to build labels in the format
+            # expected by the HF detection losses (list[dict] with 'boxes' cxcywh in [0,1]
+            # and 'class_labels'). Do not override them here to avoid format/scale drift.
+            # If, for some reason, labels are missing (older processors), rebuild as fallback.
+            if "labels" not in processed or processed["labels"] is None:
+                labels_list = []
+                for ann in annotations:
+                    anns = ann.get("annotations", [])
+                    cxcywh = []
+                    classes = []
+                    w0 = float(ann.get("width", images[0].width))
+                    h0 = float(ann.get("height", images[0].height))
+                    sx = imgsz / w0
+                    sy = imgsz / h0
+                    for a in anns:
+                        bbox = a.get("bbox")
+                        if not bbox or len(bbox) != 4:
+                            continue
+                        x, y, w, h = bbox  # top-left absolute in original dims
+                        # scale to resized image space
+                        x_s = x * sx
+                        y_s = y * sy
+                        w_s = w * sx
+                        h_s = h * sy
+                        # convert to center
+                        cx = x_s + w_s / 2.0
+                        cy = y_s + h_s / 2.0
+                        # normalize by imgsz (after resize width=height=imgsz)
+                        cxcywh.append([cx / imgsz, cy / imgsz, w_s / imgsz, h_s / imgsz])
+                        classes.append(a.get("category_id", 0))
+                    if cxcywh:
+                        labels_list.append({
+                            "boxes": torch.tensor(cxcywh, dtype=torch.float32),
+                            "class_labels": torch.tensor(classes, dtype=torch.long),
+                        })
+                    else:
+                        labels_list.append({
+                            "boxes": torch.zeros((0, 4), dtype=torch.float32),
+                            "class_labels": torch.zeros((0,), dtype=torch.long),
+                        })
+                processed["labels"] = labels_list  # type: ignore[index]
+
+            # Safety: clamp label boxes to valid [0,1] range and enforce tensor dtypes
+            # to avoid downstream numerical issues in matching/GIoU.
+            try:
+                if isinstance(processed.get("labels"), list):
+                    fixed_labels: List[Dict[str, Any]] = []
+                    for lab in processed["labels"]:  # type: ignore[index]
+                        if not isinstance(lab, dict):
+                            fixed_labels.append(lab)
+                            continue
+                        boxes = lab.get("boxes")
+                        cls = lab.get("class_labels")
+                        if boxes is not None:
+                            bt = boxes if isinstance(boxes, torch.Tensor) else torch.tensor(boxes, dtype=torch.float32)
+                            # Clamp to [0,1] for cx,cy,w,h and ensure non-negative
+                            bt = bt.to(dtype=torch.float32)
+                            bt = torch.clamp(bt, min=0.0, max=1.0)
+                            # Ensure strictly positive width/height to avoid degenerate boxes
+                            if bt.numel() and bt.shape[-1] == 4:
+                                eps = 1e-6
+                                # w,h are at indices 2,3
+                                bt[..., 2] = torch.clamp(bt[..., 2], min=eps)
+                                bt[..., 3] = torch.clamp(bt[..., 3], min=eps)
+                        else:
+                            bt = torch.zeros((0, 4), dtype=torch.float32)
+                        if cls is not None:
+                            ct = cls if isinstance(cls, torch.Tensor) else torch.tensor(cls, dtype=torch.long)
+                            ct = ct.to(dtype=torch.long)
+                        else:
+                            ct = torch.zeros((0,), dtype=torch.long)
+                        fixed_labels.append({"boxes": bt, "class_labels": ct})
+                    processed["labels"] = fixed_labels  # type: ignore[index]
+            except Exception:
+                pass
+            # Build torchmetrics-friendly targets (absolute xyxy) directly from original YOLO/Coco bboxes
+            # This avoids any potential label loss during image_processor handling and ensures GT present for eval.
+            tm_targets: List[Dict[str, torch.Tensor]] = []
             for ann in annotations:
                 anns = ann.get("annotations", [])
-                cxcywh = []
-                classes = []
                 w0 = float(ann.get("width", images[0].width))
                 h0 = float(ann.get("height", images[0].height))
-                sx = imgsz / w0
-                sy = imgsz / h0
+                sx = imgsz / max(1.0, w0)
+                sy = imgsz / max(1.0, h0)
+                boxes_xyxy: List[List[float]] = []
+                labels_long: List[int] = []
                 for a in anns:
-                    bbox = a.get("bbox")
-                    if not bbox or len(bbox) != 4:
+                    bb = a.get("bbox")
+                    cid = a.get("category_id", 0)
+                    if not bb or len(bb) != 4:
                         continue
-                    x, y, w, h = bbox  # top-left absolute in original dims
-                    # scale to resized image space
-                    x_s = x * sx
-                    y_s = y * sy
-                    w_s = w * sx
-                    h_s = h * sy
-                    # convert to center
-                    cx = x_s + w_s / 2.0
-                    cy = y_s + h_s / 2.0
-                    # normalize by imgsz (after resize width=height=imgsz)
-                    cxcywh.append([cx / imgsz, cy / imgsz, w_s / imgsz, h_s / imgsz])
-                    classes.append(a.get("category_id", 0))
-                if cxcywh:
-                    labels_list.append({
-                        "boxes": torch.tensor(cxcywh, dtype=torch.float32),
-                        "class_labels": torch.tensor(classes, dtype=torch.long),
+                    x, y, w, h = map(float, bb)
+                    # scale to resized canvas
+                    x1 = max(0.0, min(x * sx, imgsz))
+                    y1 = max(0.0, min(y * sy, imgsz))
+                    x2 = max(0.0, min((x + w) * sx, imgsz))
+                    y2 = max(0.0, min((y + h) * sy, imgsz))
+                    # ensure valid box
+                    if x2 > x1 and y2 > y1:
+                        boxes_xyxy.append([x1, y1, x2, y2])
+                        labels_long.append(int(cid))
+                if boxes_xyxy:
+                    tm_targets.append({
+                        "boxes": torch.tensor(boxes_xyxy, dtype=torch.float32),
+                        "labels": torch.tensor(labels_long, dtype=torch.long),
                     })
                 else:
-                    labels_list.append({
+                    tm_targets.append({
                         "boxes": torch.zeros((0, 4), dtype=torch.float32),
-                        "class_labels": torch.zeros((0,), dtype=torch.long),
+                        "labels": torch.zeros((0,), dtype=torch.long),
                     })
-            processed["labels"] = labels_list  # type: ignore[index]
+            processed["tm_targets"] = tm_targets  # type: ignore[index]
             return processed
 
         train_loader = DataLoader(train_ds, batch_size=batch, shuffle=True, collate_fn=collate)
@@ -439,13 +514,16 @@ class TransformersDeformableDetrBackend:
             pass
 
         # Build TrainingArguments for HF Trainer
-        wd = float((extra or {}).get("weight_decay", 1e-4))
+        wd = float((extra or {}).get("weight_decay", 1e-6))
         warmup_steps = min(100, max(10, len(train_loader)))
         # Allow metric threshold override
         try:
             self._metric_score_thresh = float((extra or {}).get("metric_score_thresh", 0.05))
         except Exception:
             self._metric_score_thresh = 0.05  # type: ignore[attr-defined]
+        # Mixed precision can cause unstable box predictions in some environments; default off.
+        use_fp16 = bool((extra or {}).get("fp16", False)) and torch.cuda.is_available()
+        use_bf16 = bool((extra or {}).get("bf16", False)) and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
         _args: Dict[str, Any] = dict(
             output_dir=str(out_dir),
             num_train_epochs=epochs,
@@ -461,7 +539,8 @@ class TransformersDeformableDetrBackend:
             warmup_steps=warmup_steps,
             report_to=[],
             remove_unused_columns=False,
-            fp16=torch.cuda.is_available(),
+            fp16=use_fp16,
+            bf16=use_bf16,
             # Important for detection tasks so label_ids remain a list[dict] per image
             eval_do_concat_batches=False,
         )
@@ -695,7 +774,7 @@ class TransformersDeformableDetrBackend:
                 ious = _box_iou(boxes[i].unsqueeze(0), boxes[idxs[1:]])[0]
                 idxs = idxs[1:][ious <= iou_thresh]
             return torch.tensor(keep, device=boxes.device, dtype=torch.long)
-        vis_max = int(ex.get("val_vis_max", 300))  # number of validation images to dump (0 = disable)
+        vis_max = int(ex.get("val_vis_max", 600))  # number of validation images to dump (0 = disable)
         vis_dir = out_dir / "val_vis"
         if vis_max > 0:
             vis_dir.mkdir(parents=True, exist_ok=True)
@@ -715,9 +794,20 @@ class TransformersDeformableDetrBackend:
         # Prepare torchmetrics MeanAveragePrecision for evaluation metrics
         use_tm_map = MeanAveragePrecision is not None
         mp = MeanAveragePrecision(box_format="xyxy", iou_type="bbox") if use_tm_map else None
+        # Debug instrumentation: log per-image eval info
+        debug_enable = True
+        debug_limit = int((extra or {}).get("debug_eval_limit", 100))
+        debug_logged = 0
+        debug_file = out_dir / "debug_eval.jsonl"
+        try:
+            if debug_enable and debug_file.exists():
+                debug_file.unlink()
+        except Exception:
+            pass
         with torch.no_grad():
             for batch_inputs in val_loader:
                 batch_inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch_inputs.items()}
+                tm_targets_in = batch_inputs.pop("tm_targets", None)
                 # One-time adaptive resize of loss weights to match logits classes (validation)
                 if preds_collected == 0:
                     try:
@@ -753,14 +843,83 @@ class TransformersDeformableDetrBackend:
                         except Exception:
                             pass
                 # labels is a list[dict]; move nested tensors
-                if isinstance(batch_inputs.get("labels"), list):  # type: ignore[truthy-bool]
-                    moved_labels = []
-                    for lab in batch_inputs["labels"]:  # type: ignore[index]
-                        if isinstance(lab, dict):
-                            moved_labels.append({lk: lv.to(self.device) if isinstance(lv, torch.Tensor) else lv for lk, lv in lab.items()})
-                        else:
-                            moved_labels.append(lab)
-                    batch_inputs["labels"] = moved_labels  # type: ignore[index]
+                labels_in = batch_inputs.get("labels") if isinstance(batch_inputs, dict) else None
+                if isinstance(labels_in, (list, tuple)):  # type: ignore[truthy-bool]
+                    def _move_labels_to_device(labels_list: List[Any]) -> List[Any]:
+                        moved: List[Any] = []
+                        for it in list(labels_list):
+                            if isinstance(it, dict):
+                                d2: Dict[str, Any] = {}
+                                for lk, lv in it.items():
+                                    if isinstance(lv, torch.Tensor):
+                                        d2[lk] = lv.to(self.device)
+                                    elif isinstance(lv, (list, tuple, np.ndarray)):
+                                        if lk == "class_labels":
+                                            d2[lk] = torch.tensor(lv, dtype=torch.long, device=self.device)
+                                        else:
+                                            # Special handling for boxes: enforce (N,4) even when empty
+                                            if lk == "boxes":
+                                                try:
+                                                    if isinstance(lv, (list, tuple)) and len(lv) == 0:
+                                                        d2[lk] = torch.zeros((0, 4), dtype=torch.float32, device=self.device)
+                                                    else:
+                                                        bt = torch.tensor(lv, dtype=torch.float32, device=self.device)
+                                                        if bt.numel() == 0:
+                                                            bt = torch.zeros((0, 4), dtype=torch.float32, device=self.device)
+                                                        elif bt.ndim == 1 and bt.numel() % 4 == 0:
+                                                            bt = bt.view(-1, 4)
+                                                        d2[lk] = bt
+                                                except Exception:
+                                                    d2[lk] = torch.zeros((0, 4), dtype=torch.float32, device=self.device)
+                                            else:
+                                                d2[lk] = torch.tensor(lv, dtype=torch.float32, device=self.device)
+                                    else:
+                                        d2[lk] = lv
+                                # Ensure required keys exist
+                                if "boxes" not in d2:
+                                    d2["boxes"] = torch.zeros((0, 4), dtype=torch.float32, device=self.device)
+                                if "class_labels" not in d2:
+                                    d2["class_labels"] = torch.zeros((0,), dtype=torch.long, device=self.device)
+                                # Safety: dtypes and clamping
+                                if "boxes" in d2 and isinstance(d2["boxes"], torch.Tensor):
+                                    if d2["boxes"].numel() and d2["boxes"].shape[-1] == 4:
+                                        eps = 1e-6
+                                        bx = d2["boxes"].to(dtype=torch.float32)
+                                        bx = torch.clamp(bx, min=0.0, max=1.0)
+                                        bx[..., 2] = torch.clamp(bx[..., 2], min=eps)
+                                        bx[..., 3] = torch.clamp(bx[..., 3], min=eps)
+                                        d2["boxes"] = bx
+                                if "class_labels" in d2 and isinstance(d2["class_labels"], torch.Tensor):
+                                    d2["class_labels"] = d2["class_labels"].to(dtype=torch.long)
+                                moved.append(d2)
+                            else:
+                                # Non-dict target: convert to empty target on device
+                                moved.append({
+                                    "boxes": torch.zeros((0, 4), dtype=torch.float32, device=self.device),
+                                    "class_labels": torch.zeros((0,), dtype=torch.long, device=self.device),
+                                })
+                        return moved
+
+                    batch_inputs["labels"] = _move_labels_to_device(labels_in)  # type: ignore[index]
+                    # Assert all label tensors are on same device for the first batch
+                    try:
+                        for li, it in enumerate(batch_inputs["labels"][:2]):
+                            if isinstance(it, dict):
+                                bx = it.get("boxes")
+                                cl = it.get("class_labels")
+                                if isinstance(bx, torch.Tensor):
+                                    assert bx.device.type == torch.device(self.device).type, f"label[{li}].boxes on {bx.device} != {self.device}"
+                                if isinstance(cl, torch.Tensor):
+                                    assert cl.device.type == torch.device(self.device).type, f"label[{li}].class_labels on {cl.device} != {self.device}"
+                                if preds_collected == 0:
+                                    bx_dev = (bx.device.type if isinstance(bx, torch.Tensor) else type(bx).__name__)
+                                    cl_dev = (cl.device.type if isinstance(cl, torch.Tensor) else type(cl).__name__)
+                                    print(f"[DEBUG validate] label[{li}] boxes device={bx_dev} cls device={cl_dev}")
+                    except Exception as dbg_e:
+                        try:
+                            print(f"[DEBUG validate] label device check: {dbg_e}")
+                        except Exception:
+                            pass
                 outputs = self.model(**batch_inputs)
                 losses.append(outputs.loss.item())
                 preds_collected += batch_inputs["pixel_values"].shape[0]
@@ -774,6 +933,17 @@ class TransformersDeformableDetrBackend:
                             threshold=score_thresh,
                             target_sizes=tgt_sizes_b,
                         )
+                        # Optional debug: also get raw (no-threshold) post for inspection
+                        post_raw = None
+                        if debug_enable and debug_logged < debug_limit:
+                            try:
+                                post_raw = self.image_processor.post_process_object_detection(
+                                    outputs,
+                                    threshold=0.0,
+                                    target_sizes=tgt_sizes_b,
+                                )
+                            except Exception:
+                                post_raw = None
                         preds_tm: List[Dict[str, torch.Tensor]] = []
                         for res in post:
                             boxes = res.get("boxes")
@@ -787,30 +957,82 @@ class TransformersDeformableDetrBackend:
                                     "scores": torch.as_tensor(scores, dtype=torch.float32).to("cpu"),
                                     "labels": torch.as_tensor(labels, dtype=torch.long).to("cpu"),
                                 })
+                        # Prefer tm_targets from collate if available
                         targets_tm: List[Dict[str, torch.Tensor]] = []
-                        labels_list = batch_inputs.get("labels") if isinstance(batch_inputs, dict) else None
-                        if isinstance(labels_list, list):
-                            for t in labels_list[:len(preds_tm)]:
-                                if not isinstance(t, dict):
-                                    targets_tm.append({"boxes": torch.zeros((0, 4)), "labels": torch.zeros((0,), dtype=torch.long)})
-                                    continue
-                                tb = t.get("boxes")
-                                tl = t.get("class_labels")
-                                tb_t = tb if isinstance(tb, torch.Tensor) else torch.tensor(tb) if tb is not None else torch.zeros((0, 4))
-                                tl_t = tl if isinstance(tl, torch.Tensor) else torch.tensor(tl, dtype=torch.long) if tl is not None else torch.zeros((0,), dtype=torch.long)
-                                if tb_t.numel():
-                                    cx, cy, w_, h_ = tb_t.unbind(-1)
-                                    x1 = (cx - 0.5 * w_) * imgsz
-                                    y1 = (cy - 0.5 * h_) * imgsz
-                                    x2 = (cx + 0.5 * w_) * imgsz
-                                    y2 = (cy + 0.5 * h_) * imgsz
-                                    boxes_xyxy = torch.stack([x1, y1, x2, y2], -1)
+                        if isinstance(tm_targets_in, (list, tuple)):
+                            for t in tm_targets_in[:len(preds_tm)]:
+                                if isinstance(t, dict):
+                                    tb = t.get("boxes")
+                                    tl = t.get("labels")
+                                    tb_t = tb if isinstance(tb, torch.Tensor) else torch.tensor(tb) if tb is not None else torch.zeros((0, 4))
+                                    tl_t = tl if isinstance(tl, torch.Tensor) else torch.tensor(tl, dtype=torch.long) if tl is not None else torch.zeros((0,), dtype=torch.long)
+                                    targets_tm.append({
+                                        "boxes": tb_t.to(dtype=torch.float32).to("cpu"),
+                                        "labels": tl_t.to(dtype=torch.long).to("cpu"),
+                                    })
                                 else:
-                                    boxes_xyxy = torch.zeros((0, 4))
-                                targets_tm.append({
-                                    "boxes": boxes_xyxy.to(dtype=torch.float32).to("cpu"),
-                                    "labels": tl_t.to(dtype=torch.long).to("cpu"),
-                                })
+                                    targets_tm.append({"boxes": torch.zeros((0, 4)), "labels": torch.zeros((0,), dtype=torch.long)})
+                        else:
+                            targets_tm = [{"boxes": torch.zeros((0, 4)), "labels": torch.zeros((0,), dtype=torch.long)} for _ in range(len(preds_tm))]
+                        # Debug: write compact per-image info
+                        if debug_enable and debug_logged < debug_limit:
+                            try:
+                                id2label = getattr(self.model.config, "id2label", {})
+                                for i_img in range(len(preds_tm)):
+                                    entry: Dict[str, Any] = {}
+                                    p = preds_tm[i_img]
+                                    t = targets_tm[i_img] if i_img < len(targets_tm) else {"boxes": torch.zeros((0,4)), "labels": torch.zeros((0,), dtype=torch.long)}
+                                    # counts
+                                    entry["pred_count_thresh"] = int(p["boxes"].shape[0])
+                                    entry["gt_count"] = int(t["boxes"].shape[0])
+                                    # raw counts if available
+                                    if post_raw is not None and i_img < len(post_raw):
+                                        pr = post_raw[i_img]
+                                        rb = pr.get("boxes")
+                                        entry["pred_count_raw"] = int(len(rb)) if rb is not None else 0
+                                    # top scores
+                                    if p["boxes"].numel():
+                                        scores = p["scores"].tolist()
+                                        labels = p["labels"].tolist()
+                                        # show top 5
+                                        top_idx = np.argsort(scores)[::-1][:5]
+                                        entry["top_scores"] = [float(scores[j]) for j in top_idx]
+                                        entry["top_labels"] = [int(labels[j]) for j in top_idx]
+                                        entry["top_class_names"] = [str(id2label.get(int(labels[j]), str(int(labels[j])))) for j in top_idx]
+                                    else:
+                                        entry["top_scores"] = []
+                                        entry["top_labels"] = []
+                                        entry["top_class_names"] = []
+                                    # label ranges
+                                    if entry["gt_count"]:
+                                        gtl = t["labels"].tolist()
+                                        entry["gt_label_min"] = int(min(gtl)) if gtl else None
+                                        entry["gt_label_max"] = int(max(gtl)) if gtl else None
+                                    else:
+                                        entry["gt_label_min"] = None
+                                        entry["gt_label_max"] = None
+                                    # box stats
+                                    if entry["gt_count"]:
+                                        b = t["boxes"].numpy()
+                                        w = (b[:,2] - b[:,0]).clip(min=0)
+                                        h = (b[:,3] - b[:,1]).clip(min=0)
+                                        entry["gt_box_wh_min"] = [float(w.min()), float(h.min())] if len(w) else [None, None]
+                                        entry["gt_box_wh_max"] = [float(w.max()), float(h.max())] if len(w) else [None, None]
+                                    # threshold used
+                                    entry["score_thresh"] = float(score_thresh)
+                                    # image size used for post-process
+                                    entry["target_size"] = [int(imgsz), int(imgsz)]
+                                    # mapping size
+                                    entry["num_classes_model"] = int(getattr(self.model.config, "num_labels", 0))
+                                    entry["num_classes_dataset"] = int(len(class_names)) if class_names else None
+                                    # write JSONL
+                                    with debug_file.open("a") as fdbg:
+                                        fdbg.write(json.dumps(entry) + "\n")
+                                    debug_logged += 1
+                                    if debug_logged >= debug_limit:
+                                        break
+                            except Exception:
+                                pass
                         mp.update(preds=preds_tm, target=targets_tm)
                     except Exception:
                         pass
@@ -902,33 +1124,51 @@ class TransformersDeformableDetrBackend:
                             if labels is not None and len(labels) == len(det):
                                 canvas = label_annotator.annotate(scene=canvas, detections=det, labels=labels)
 
-                            # Overlay Ground Truth in green
+                            # Overlay Ground Truth in green (prefer tm_targets absolute boxes)
                             try:
-                                labels_list = batch_inputs.get("labels") if isinstance(batch_inputs, dict) else None
-                                if isinstance(labels_list, list) and bi < len(labels_list):
-                                    gt_entry = labels_list[bi]
-                                    if isinstance(gt_entry, dict):
-                                        gtb = gt_entry.get("boxes")
-                                        gtl = gt_entry.get("class_labels")
-                                        if isinstance(gtb, torch.Tensor) and isinstance(gtl, torch.Tensor) and gtb.numel():
-                                            cxg, cyg, wg, hg = gtb.unbind(-1)
-                                            x1g = (cxg - 0.5 * wg) * imgsz
-                                            y1g = (cyg - 0.5 * hg) * imgsz
-                                            x2g = (cxg + 0.5 * wg) * imgsz
-                                            y2g = (cyg + 0.5 * hg) * imgsz
-                                            gt_xyxy = torch.stack([x1g, y1g, x2g, y2g], dim=-1).detach().cpu().tolist()
-                                            # Draw with PIL to ensure consistent coloring irrespective of annotator API
-                                            pil_canvas = Image.fromarray(canvas)
-                                            draw = ImageDraw.Draw(pil_canvas)
-                                            for gj, boxg in enumerate(gt_xyxy):
-                                                cls_idg = int(gtl[gj].detach().cpu().item())
-                                                cls_name_g = class_names[cls_idg] if class_names and cls_idg < len(class_names) else str(cls_idg)
-                                                draw.rectangle(boxg, outline="green", width=2)
-                                                try:
-                                                    draw.text((boxg[0] + 2, boxg[1] + 2), f"G {cls_name_g}", fill="green")
-                                                except Exception:
-                                                    pass
-                                            canvas = np.array(pil_canvas)
+                                gt_boxes_xyxy = None
+                                gt_labels_long = None
+                                # Prefer tm_targets (absolute xyxy on imgsz canvas)
+                                if isinstance(tm_targets_in, (list, tuple)) and bi < len(tm_targets_in):
+                                    t = tm_targets_in[bi]
+                                    if isinstance(t, dict):
+                                        tb = t.get("boxes")
+                                        tl = t.get("labels")
+                                        if isinstance(tb, torch.Tensor) and isinstance(tl, torch.Tensor) and tb.numel():
+                                            gt_boxes_xyxy = tb.detach().cpu().tolist()
+                                            gt_labels_long = tl.detach().cpu().tolist()
+                                # Fallback to normalized labels from batch_inputs
+                                if gt_boxes_xyxy is None:
+                                    labels_list = batch_inputs.get("labels") if isinstance(batch_inputs, dict) else None
+                                    if isinstance(labels_list, list) and bi < len(labels_list):
+                                        gt_entry = labels_list[bi]
+                                        if isinstance(gt_entry, dict):
+                                            gtb = gt_entry.get("boxes")
+                                            gtl = gt_entry.get("class_labels")
+                                            if isinstance(gtb, torch.Tensor) and isinstance(gtl, torch.Tensor) and gtb.numel():
+                                                cxg, cyg, wg, hg = gtb.unbind(-1)
+                                                x1g = (cxg - 0.5 * wg) * imgsz
+                                                y1g = (cyg - 0.5 * hg) * imgsz
+                                                x2g = (cxg + 0.5 * wg) * imgsz
+                                                y2g = (cyg + 0.5 * hg) * imgsz
+                                                gt_boxes_xyxy = torch.stack([x1g, y1g, x2g, y2g], dim=-1).detach().cpu().tolist()
+                                                gt_labels_long = gtl.detach().cpu().tolist()
+                                # Draw if available
+                                if gt_boxes_xyxy is not None and len(gt_boxes_xyxy) > 0:
+                                    pil_canvas = Image.fromarray(canvas)
+                                    draw = ImageDraw.Draw(pil_canvas)
+                                    for gj, boxg in enumerate(gt_boxes_xyxy):
+                                        try:
+                                            cls_idg = int(gt_labels_long[gj]) if gt_labels_long is not None and gj < len(gt_labels_long) else -1
+                                        except Exception:
+                                            cls_idg = -1
+                                        cls_name_g = class_names[cls_idg] if (class_names and 0 <= cls_idg < len(class_names)) else (str(cls_idg) if cls_idg >= 0 else "GT")
+                                        draw.rectangle(boxg, outline="green", width=2)
+                                        try:
+                                            draw.text((boxg[0] + 2, boxg[1] + 2), f"G {cls_name_g}", fill="green")
+                                        except Exception:
+                                            pass
+                                    canvas = np.array(pil_canvas)
                             except Exception:
                                 pass
 
@@ -960,6 +1200,12 @@ class TransformersDeformableDetrBackend:
         if vis_max > 0:
             metrics["visualizations"] = saved_images
         (out_dir / "val_metrics.json").write_text(json.dumps(metrics, indent=2))
+        # Print a small summary pointer for debug
+        if debug_enable:
+            try:
+                print(f"[INFO] Debug eval logs: {debug_file} (first {debug_logged} images)")
+            except Exception:
+                pass
         try:
             extra_vis = f" visualizations={saved_images} -> {vis_dir}" if vis_max > 0 else ""
             map_msg = ""
