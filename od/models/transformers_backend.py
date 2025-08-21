@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Callable
+from typing import Any, Dict, List, Optional, Tuple, Callable, Sequence
 import warnings
 warnings.filterwarnings("ignore", message=r"for .*meta parameter")
 
@@ -44,6 +44,28 @@ def _read_yaml(path: str | Path) -> Dict[str, Any]:
         return {}
     with open(path, "r") as f:
         return yaml.safe_load(f) or {}
+
+
+class _KwargFilterModel(torch.nn.Module):
+    """Thin wrapper that drops unknown kwargs before delegating to the base model.
+
+    Useful when training with generic collators that may include auxiliary keys
+    not present in model.forward (e.g., 'tm_targets').
+    """
+
+    def __init__(self, base: torch.nn.Module, allowed_keys: Optional[set[str]] = None):
+        super().__init__()
+        self.base = base
+        self._allowed_keys = set(allowed_keys or {"pixel_values", "pixel_mask", "labels"})
+        # Expose common attributes expected by HF utilities
+        self.config = getattr(base, "config", None)
+
+    def forward(self, *args: Any, **kwargs: Any):  # type: ignore[override]
+        if kwargs:
+            kwargs = {k: v for k, v in kwargs.items() if k in self._allowed_keys}
+        return self.base(*args, **kwargs)  # type: ignore[misc]
+
+    # No __getattr__ to avoid recursion issues; rely on torch.nn.Module default behavior.
 
 
 @dataclass
@@ -569,6 +591,29 @@ class TransformersDeformableDetrBackend:
                 annotations = [s.target for s in samples]
                 processed = self.image_processor(images, annotations=annotations, return_tensors="pt", size={"height": imgsz, "width": imgsz})
                 return processed
+        # Always strip auxiliary keys not accepted by model.forward (e.g., 'tm_targets')
+        # to avoid unexpected keyword errors in Trainer's model(**inputs) call.
+        def _trainer_collator(samples: List[_Sample]):
+            """Wrap the main collator and strictly filter keys to model-accepted ones.
+
+            This avoids passing auxiliary keys (e.g., 'tm_targets') to model(**inputs),
+            which would otherwise raise TypeError in forward.
+            """
+            batch = data_collator(samples)  # type: ignore[misc]
+            if not isinstance(batch, dict):
+                return batch
+            # Allowed input keys for HF detection models (YOLOS/DETR-style)
+            allowed_keys = {"pixel_values", "pixel_mask", "labels"}
+            # Drop auxiliary keys (like 'tm_targets') and anything unexpected
+            filtered = {k: v for k, v in batch.items() if k in allowed_keys}
+            # One-time debug of keys passed to model
+            if not hasattr(self, "_trainer_collator_debug_done"):
+                try:
+                    print("[DEBUG trainer_collator] outbound keys:", list(filtered.keys()))
+                except Exception:
+                    pass
+                self._trainer_collator_debug_done = True  # type: ignore[attr-defined]
+            return filtered
 
         # Build torchmetrics-based compute_metrics (MeanAveragePrecision)
         def _build_compute_metrics(imgsz_local: int):
@@ -663,12 +708,14 @@ class TransformersDeformableDetrBackend:
                     return {}
             return _compute_metrics
 
+        # Wrap model to defensively filter unexpected kwargs (like 'tm_targets')
+        wrapped_model = _KwargFilterModel(self.model)  # type: ignore[arg-type]
         trainer = Trainer(
-            model=self.model,
+            model=wrapped_model,
             args=args,
             train_dataset=train_loader.dataset,  # type: ignore[arg-type]
             eval_dataset=val_loader.dataset,    # type: ignore[arg-type]
-            data_collator=data_collator,        # type: ignore[arg-type]
+            data_collator=_trainer_collator,    # type: ignore[arg-type]
             compute_metrics=_build_compute_metrics(imgsz) if MeanAveragePrecision is not None else None,
         )
 
@@ -845,7 +892,7 @@ class TransformersDeformableDetrBackend:
                 # labels is a list[dict]; move nested tensors
                 labels_in = batch_inputs.get("labels") if isinstance(batch_inputs, dict) else None
                 if isinstance(labels_in, (list, tuple)):  # type: ignore[truthy-bool]
-                    def _move_labels_to_device(labels_list: List[Any]) -> List[Any]:
+                    def _move_labels_to_device(labels_list: Sequence[Any]) -> List[Any]:
                         moved: List[Any] = []
                         for it in list(labels_list):
                             if isinstance(it, dict):
@@ -900,7 +947,7 @@ class TransformersDeformableDetrBackend:
                                 })
                         return moved
 
-                    batch_inputs["labels"] = _move_labels_to_device(labels_in)  # type: ignore[index]
+                    batch_inputs["labels"] = _move_labels_to_device(list(labels_in))  # type: ignore[index]
                     # Assert all label tensors are on same device for the first batch
                     try:
                         for li, it in enumerate(batch_inputs["labels"][:2]):
