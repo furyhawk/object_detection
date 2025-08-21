@@ -491,11 +491,10 @@ class TransformersDeformableDetrBackend:
                 processed = self.image_processor(images, annotations=annotations, return_tensors="pt", size={"height": imgsz, "width": imgsz})
                 return processed
 
-        # Build supervision-based compute_metrics if supervision is available
+        # Build torchmetrics-based compute_metrics (MeanAveragePrecision)
         def _build_compute_metrics(imgsz_local: int):
-            # Compute mAP metrics via supervision using HF post_process outputs
             def _compute_metrics(eval_pred):  # type: ignore[no-redef]
-                if sv is None:
+                if MeanAveragePrecision is None:
                     return {}
                 predictions = getattr(eval_pred, "predictions", None)
                 targets = getattr(eval_pred, "label_ids", None)
@@ -505,7 +504,7 @@ class TransformersDeformableDetrBackend:
                 seq = predictions if isinstance(predictions, (list, tuple)) else [predictions]
                 pred_logits = None
                 pred_boxes = None
-                for i, arr in enumerate(seq):
+                for arr in seq:
                     try:
                         sh = arr.shape  # type: ignore[attr-defined]
                     except Exception:
@@ -517,7 +516,7 @@ class TransformersDeformableDetrBackend:
                             pred_logits = arr
                 if pred_boxes is None or pred_logits is None:
                     return {}
-                # Build a lightweight object with .logits and .pred_boxes expected by post_process
+                # Minimal object with logits and pred_boxes for post_process
                 class _O:
                     pass
                 o = _O()
@@ -533,58 +532,56 @@ class TransformersDeformableDetrBackend:
                     )
                 except Exception:
                     return {}
-                pred_dets = []
+                # Prepare predictions for torchmetrics (list of dicts)
+                preds_tm: List[Dict[str, torch.Tensor]] = []
                 for res in post:
-                    try:
-                        det = sv.Detections.from_transformers(res)
-                    except Exception:
-                        det = sv.Detections(xyxy=np.zeros((0, 4)), class_id=np.zeros((0,), dtype=int))
-                    pred_dets.append(det)
-                # Build target detections
-                tgt_dets = []
-                try:
-                    t_list = []
-                    # targets should be list[dict] per image when eval_do_concat_batches=False
-                    if isinstance(targets, list) and all(isinstance(t, dict) for t in targets):
-                        t_list = targets  # type: ignore[assignment]
-                    elif isinstance(targets, list) and all(isinstance(t, list) for t in targets):
-                        # Some trainer versions nest per-batch lists
-                        t_list = [ti for batch in targets for ti in batch if isinstance(ti, dict)]
+                    boxes = res.get("boxes")
+                    scores = res.get("scores")
+                    labels = res.get("labels")
+                    if boxes is None or scores is None or labels is None:
+                        preds_tm.append({"boxes": torch.zeros((0, 4)), "scores": torch.zeros((0,)), "labels": torch.zeros((0,), dtype=torch.long)})
                     else:
-                        t_list = []
-                    for t in t_list:
-                        tb = t.get("boxes")
-                        tl = t.get("class_labels")
-                        if isinstance(tb, torch.Tensor):
-                            tb_t = tb
-                        else:
-                            tb_t = torch.tensor(tb) if tb is not None else torch.zeros((0, 4))
-                        if isinstance(tl, torch.Tensor):
-                            tl_t = tl
-                        else:
-                            tl_t = torch.tensor(tl, dtype=torch.long) if tl is not None else torch.zeros((0,), dtype=torch.long)
-                        if tb_t.numel():
-                            cx, cy, w_, h_ = tb_t.unbind(-1)
-                            x1 = (cx - 0.5 * w_) * imgsz_local
-                            y1 = (cy - 0.5 * h_) * imgsz_local
-                            x2 = (cx + 0.5 * w_) * imgsz_local
-                            y2 = (cy + 0.5 * h_) * imgsz_local
-                            xyxy = torch.stack([x1, y1, x2, y2], -1).cpu().numpy()
-                        else:
-                            xyxy = np.zeros((0, 4))
-                        tgt_dets.append(sv.Detections(xyxy=xyxy, class_id=tl_t.detach().cpu().numpy()))
-                except Exception:
-                    tgt_dets = [sv.Detections(xyxy=np.zeros((0, 4)), class_id=np.zeros((0,), dtype=int)) for _ in range(len(pred_dets))]
+                        preds_tm.append({
+                            "boxes": torch.as_tensor(boxes, dtype=torch.float32),
+                            "scores": torch.as_tensor(scores, dtype=torch.float32),
+                            "labels": torch.as_tensor(labels, dtype=torch.long),
+                        })
+                # Prepare targets for torchmetrics (list of dicts, xyxy absolute)
+                t_list: List[Dict[str, Any]] = []
+                if isinstance(targets, list) and all(isinstance(t, dict) for t in targets):
+                    t_list = targets  # type: ignore[assignment]
+                elif isinstance(targets, list) and all(isinstance(t, list) for t in targets):
+                    t_list = [ti for batch in targets for ti in batch if isinstance(ti, dict)]
+                targets_tm: List[Dict[str, torch.Tensor]] = []
+                for t in t_list[:len(preds_tm)]:
+                    tb = t.get("boxes")
+                    tl = t.get("class_labels")
+                    tb_t = tb if isinstance(tb, torch.Tensor) else torch.tensor(tb) if tb is not None else torch.zeros((0, 4))
+                    tl_t = tl if isinstance(tl, torch.Tensor) else torch.tensor(tl, dtype=torch.long) if tl is not None else torch.zeros((0,), dtype=torch.long)
+                    if tb_t.numel():
+                        cx, cy, w_, h_ = tb_t.unbind(-1)
+                        x1 = (cx - 0.5 * w_) * imgsz_local
+                        y1 = (cy - 0.5 * h_) * imgsz_local
+                        x2 = (cx + 0.5 * w_) * imgsz_local
+                        y2 = (cy + 0.5 * h_) * imgsz_local
+                        boxes_xyxy = torch.stack([x1, y1, x2, y2], -1)
+                    else:
+                        boxes_xyxy = torch.zeros((0, 4))
+                    targets_tm.append({
+                        "boxes": boxes_xyxy.to(dtype=torch.float32),
+                        "labels": tl_t.to(dtype=torch.long),
+                    })
                 try:
-                    mp = sv.MeanAveragePrecision.from_detections(predictions=pred_dets, targets=tgt_dets)
+                    mp = MeanAveragePrecision(box_format="xyxy", iou_type="bbox")
+                    mp.update(preds=preds_tm, target=targets_tm)
+                    res = mp.compute()
                     return {
-                        "map50_95": float(mp.map50_95),
-                        "map50": float(mp.map50),
-                        "map75": float(mp.map75),
+                        "map50_95": float(res.get("map", torch.tensor(0.0)).item()),
+                        "map50": float(res.get("map_50", torch.tensor(0.0)).item()),
+                        "map75": float(res.get("map_75", torch.tensor(0.0)).item()),
                     }
                 except Exception:
                     return {}
-
             return _compute_metrics
 
         trainer = Trainer(
@@ -593,7 +590,7 @@ class TransformersDeformableDetrBackend:
             train_dataset=train_loader.dataset,  # type: ignore[arg-type]
             eval_dataset=val_loader.dataset,    # type: ignore[arg-type]
             data_collator=data_collator,        # type: ignore[arg-type]
-            compute_metrics=_build_compute_metrics(imgsz) if sv is not None else None,
+            compute_metrics=_build_compute_metrics(imgsz) if MeanAveragePrecision is not None else None,
         )
 
         # Execute training via Trainer
@@ -664,7 +661,7 @@ class TransformersDeformableDetrBackend:
         self.model.eval()
         losses: List[float] = []
         preds_collected: int = 0
-        # Visualization setup
+    # Visualization setup
         ex = extra or {}
         score_thresh = float(ex.get("val_score_thresh", 0.05))
         with_nms: bool = bool(ex.get("with_nms", False))
@@ -698,17 +695,26 @@ class TransformersDeformableDetrBackend:
                 ious = _box_iou(boxes[i].unsqueeze(0), boxes[idxs[1:]])[0]
                 idxs = idxs[1:][ious <= iou_thresh]
             return torch.tensor(keep, device=boxes.device, dtype=torch.long)
-        vis_max = int(ex.get("val_vis_max", 20))  # number of validation images to dump (0 = disable)
+        vis_max = int(ex.get("val_vis_max", 300))  # number of validation images to dump (0 = disable)
         vis_dir = out_dir / "val_vis"
         if vis_max > 0:
             vis_dir.mkdir(parents=True, exist_ok=True)
         saved_images = 0
         mean = getattr(self.image_processor, "image_mean", [0.0, 0.0, 0.0])
         std = getattr(self.image_processor, "image_std", [1.0, 1.0, 1.0])
-        # Prepare containers for supervision-based mAP if available
-        use_sv_map = sv is not None
-        pred_dets_all: List[Any] = []
-        tgt_dets_all: List[Any] = []
+        # Supervision annotators (if available)
+        box_annotator = None
+        label_annotator = None
+        if sv is not None:
+            try:
+                box_annotator = sv.BoxAnnotator()
+                label_annotator = sv.LabelAnnotator(text_scale=1, text_thickness=2)
+            except Exception:
+                box_annotator = None
+                label_annotator = None
+        # Prepare torchmetrics MeanAveragePrecision for evaluation metrics
+        use_tm_map = MeanAveragePrecision is not None
+        mp = MeanAveragePrecision(box_format="xyxy", iou_type="bbox") if use_tm_map else None
         with torch.no_grad():
             for batch_inputs in val_loader:
                 batch_inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch_inputs.items()}
@@ -758,8 +764,8 @@ class TransformersDeformableDetrBackend:
                 outputs = self.model(**batch_inputs)
                 losses.append(outputs.loss.item())
                 preds_collected += batch_inputs["pixel_values"].shape[0]
-                # Collect supervision-style detections for mAP if available
-                if use_sv_map:
+                # Update torchmetrics mAP if available
+                if use_tm_map and mp is not None:
                     try:
                         B = batch_inputs["pixel_values"].shape[0]
                         tgt_sizes_b = torch.tensor([(imgsz, imgsz)] * B, device=self.device)
@@ -768,18 +774,25 @@ class TransformersDeformableDetrBackend:
                             threshold=score_thresh,
                             target_sizes=tgt_sizes_b,
                         )
-                        # Predictions
+                        preds_tm: List[Dict[str, torch.Tensor]] = []
                         for res in post:
-                            try:
-                                pred_dets_all.append(sv.Detections.from_transformers(res))
-                            except Exception:
-                                pred_dets_all.append(sv.Detections(xyxy=np.zeros((0, 4)), class_id=np.zeros((0,), dtype=int)))
-                        # Targets
+                            boxes = res.get("boxes")
+                            scores = res.get("scores")
+                            labels = res.get("labels")
+                            if boxes is None or scores is None or labels is None:
+                                preds_tm.append({"boxes": torch.zeros((0, 4)), "scores": torch.zeros((0,)), "labels": torch.zeros((0,), dtype=torch.long)})
+                            else:
+                                preds_tm.append({
+                                    "boxes": torch.as_tensor(boxes, dtype=torch.float32).to("cpu"),
+                                    "scores": torch.as_tensor(scores, dtype=torch.float32).to("cpu"),
+                                    "labels": torch.as_tensor(labels, dtype=torch.long).to("cpu"),
+                                })
+                        targets_tm: List[Dict[str, torch.Tensor]] = []
                         labels_list = batch_inputs.get("labels") if isinstance(batch_inputs, dict) else None
                         if isinstance(labels_list, list):
-                            for t in labels_list:
+                            for t in labels_list[:len(preds_tm)]:
                                 if not isinstance(t, dict):
-                                    tgt_dets_all.append(sv.Detections(xyxy=np.zeros((0, 4)), class_id=np.zeros((0,), dtype=int)))
+                                    targets_tm.append({"boxes": torch.zeros((0, 4)), "labels": torch.zeros((0,), dtype=torch.long)})
                                     continue
                                 tb = t.get("boxes")
                                 tl = t.get("class_labels")
@@ -791,36 +804,34 @@ class TransformersDeformableDetrBackend:
                                     y1 = (cy - 0.5 * h_) * imgsz
                                     x2 = (cx + 0.5 * w_) * imgsz
                                     y2 = (cy + 0.5 * h_) * imgsz
-                                    xyxy = torch.stack([x1, y1, x2, y2], -1).detach().cpu().numpy()
+                                    boxes_xyxy = torch.stack([x1, y1, x2, y2], -1)
                                 else:
-                                    xyxy = np.zeros((0, 4))
-                                tgt_dets_all.append(sv.Detections(xyxy=xyxy, class_id=tl_t.detach().cpu().numpy()))
+                                    boxes_xyxy = torch.zeros((0, 4))
+                                targets_tm.append({
+                                    "boxes": boxes_xyxy.to(dtype=torch.float32).to("cpu"),
+                                    "labels": tl_t.to(dtype=torch.long).to("cpu"),
+                                })
+                        mp.update(preds=preds_tm, target=targets_tm)
                     except Exception:
                         pass
 
-                # Visualization logic (pred vs ground truth)
-                if vis_max > 0 and saved_images < vis_max:
+                # Visualization logic using Supervision (Detections + NMS + Annotators)
+                if vis_max > 0 and saved_images < vis_max and box_annotator is not None and label_annotator is not None:
                     try:
-                        logits = getattr(outputs, "logits", None)
-                        pred_boxes = getattr(outputs, "pred_boxes", None)
-                        if logits is None or pred_boxes is None:
-                            continue
-                        probs = logits.softmax(-1)[..., :-1]  # drop background
-                        scores, labels_pred = probs.max(-1)
-                        boxes_cxcywh = pred_boxes  # (B, Q, 4) normalized
-                        B, Q, _ = boxes_cxcywh.shape
-                        cx, cy, w_, h_ = boxes_cxcywh.unbind(-1)
-                        x1 = (cx - 0.5 * w_) * imgsz
-                        y1 = (cy - 0.5 * h_) * imgsz
-                        x2 = (cx + 0.5 * w_) * imgsz
-                        y2 = (cy + 0.5 * h_) * imgsz
-                        boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=-1).clamp(min=0, max=imgsz)
+                        B = batch_inputs["pixel_values"].shape[0]
+                        # Post-process to image-sized predictions (imgsz x imgsz) to match reconstructed image
+                        tgt_sizes_b = torch.tensor([(imgsz, imgsz)] * B, device=self.device)
+                        post = self.image_processor.post_process_object_detection(
+                            outputs,
+                            threshold=score_thresh,
+                            target_sizes=tgt_sizes_b,
+                        )
+                        id2label = getattr(self.model.config, "id2label", None)
 
-                        labels_list = batch_inputs.get("labels") if isinstance(batch_inputs, dict) else None
                         for bi in range(B):
                             if saved_images >= vis_max:
                                 break
-                            # Reconstruct image (unnormalize)
+                            # Reconstruct image (unnormalize) from pixel_values
                             pv = batch_inputs["pixel_values"][bi].detach().cpu()
                             try:
                                 img_np = pv.clone()
@@ -829,74 +840,101 @@ class TransformersDeformableDetrBackend:
                                         img_np[c] = img_np[c] * std[c] + mean[c]
                                 img_np = (img_np * 255.0).clamp(0, 255).byte().permute(1, 2, 0).numpy()
                             except Exception:
-                                # Fallback simple scaling
                                 img_np = (pv * 255.0).clamp(0, 255).byte().permute(1, 2, 0).numpy()
-                            vis_img = Image.fromarray(img_np)
-                            draw = ImageDraw.Draw(vis_img)
 
-                            # Predicted boxes
-                            sc = scores[bi]
-                            lb = labels_pred[bi]
-                            bx = boxes_xyxy[bi]
-                            keep = sc > score_thresh
-                            if with_nms and keep.any():
-                                if nms_class_agnostic:
-                                    sub_scores = sc[keep]
-                                    sub_boxes = bx[keep]
-                                    nms_keep_rel = _nms(sub_boxes, sub_scores, nms_iou)
-                                    keep_indices = torch.nonzero(keep, as_tuple=False).flatten()
-                                    keep_mask = torch.zeros_like(keep)
-                                    keep_mask[keep_indices[nms_keep_rel]] = True
-                                    keep = keep_mask
-                                else:
-                                    vis_keep_indices_total: List[int] = []
-                                    filtered_indices = torch.nonzero(keep, as_tuple=False).flatten()
-                                    flabels = lb[keep]
-                                    fboxes = bx[keep]
-                                    fscores = sc[keep]
-                                    for cls in flabels.unique():
-                                        cls_mask = flabels == cls
-                                        cls_boxes = fboxes[cls_mask]
-                                        cls_scores = fscores[cls_mask]
-                                        cls_keep_rel = _nms(cls_boxes, cls_scores, nms_iou)
-                                        orig_subset = filtered_indices[cls_mask]
-                                        vis_keep_indices_total.extend(orig_subset[cls_keep_rel].tolist())
-                                    keep_mask = torch.zeros_like(keep)
-                                    if vis_keep_indices_total:
-                                        keep_mask[torch.tensor(vis_keep_indices_total, device=keep_mask.device)] = True
-                                    keep = keep_mask
-                            for pj in torch.nonzero(keep, as_tuple=False).flatten().tolist():
-                                box = bx[pj].detach().cpu().tolist()
-                                cls_id = int(lb[pj].detach().cpu().item())
-                                conf = float(sc[pj].detach().cpu().item())
-                                cls_name = class_names[cls_id] if class_names and cls_id < len(class_names) else str(cls_id)
-                                x1b, y1b, x2b, y2b = box
-                                draw.rectangle([x1b, y1b, x2b, y2b], outline="red", width=2)
-                                draw.text((x1b + 2, y1b + 2), f"P {cls_name}:{conf:.2f}", fill="red")
+                            res = post[bi]
+                            # Build Supervision detections
+                            det = sv.Detections.from_transformers(
+                                transformers_results=res,
+                                id2label=id2label,
+                            )
+                            # Optional NMS
+                            if with_nms:
+                                try:
+                                    det = det.with_nms(threshold=nms_iou)  # type: ignore[attr-defined]
+                                except Exception:
+                                    from supervision.detection.utils.iou_and_nms import box_non_max_suppression
+                                    # Build predictions array for NMS
+                                    if det.confidence is None:
+                                        confs = np.ones(len(det.xyxy), dtype=float)
+                                    else:
+                                        confs = det.confidence
+                                    if not nms_class_agnostic and det.class_id is not None:
+                                        preds = np.c_[det.xyxy, confs, det.class_id]
+                                    else:
+                                        preds = np.c_[det.xyxy, confs]
+                                    keep = box_non_max_suppression(preds, iou_threshold=nms_iou)
+                                    # Slice detections
+                                    data_sliced = {}
+                                    if det.data:
+                                        for k, v in det.data.items():
+                                            try:
+                                                if hasattr(v, "__len__") and len(v) == len(det):
+                                                    data_sliced[k] = v[keep]
+                                            except Exception:
+                                                pass
+                                    det = sv.Detections(
+                                        xyxy=det.xyxy[keep],
+                                        confidence=(det.confidence[keep] if det.confidence is not None else None),
+                                        class_id=(det.class_id[keep] if det.class_id is not None else None),
+                                        data=data_sliced,
+                                    )
 
-                            # Ground truth boxes (in labels_list normalized cxcywh)
-                            if isinstance(labels_list, list) and bi < len(labels_list):
-                                gt_entry = labels_list[bi]
-                                if isinstance(gt_entry, dict):
-                                    gtb = gt_entry.get("boxes")
-                                    gtl = gt_entry.get("class_labels")
-                                    if isinstance(gtb, torch.Tensor) and isinstance(gtl, torch.Tensor):
-                                        if gtb.numel():
+                            # Compose labels: class name + confidence
+                            pred_class_names = None
+                            if det.data and "class_name" in det.data:
+                                try:
+                                    pred_class_names = det.data["class_name"]
+                                except Exception:
+                                    pred_class_names = None
+                            if pred_class_names is None and det.class_id is not None and id2label is not None:
+                                pred_class_names = np.array([id2label.get(int(ci), str(int(ci))) for ci in det.class_id])
+                            if det.confidence is not None and pred_class_names is not None:
+                                labels = [f"{cn} {cf:.2f}" for cn, cf in zip(pred_class_names, det.confidence)]
+                            elif pred_class_names is not None:
+                                labels = [str(cn) for cn in pred_class_names]
+                            else:
+                                labels = None
+
+                            # Annotate predictions
+                            canvas = img_np.copy()
+                            canvas = box_annotator.annotate(scene=canvas, detections=det)
+                            if labels is not None and len(labels) == len(det):
+                                canvas = label_annotator.annotate(scene=canvas, detections=det, labels=labels)
+
+                            # Overlay Ground Truth in green
+                            try:
+                                labels_list = batch_inputs.get("labels") if isinstance(batch_inputs, dict) else None
+                                if isinstance(labels_list, list) and bi < len(labels_list):
+                                    gt_entry = labels_list[bi]
+                                    if isinstance(gt_entry, dict):
+                                        gtb = gt_entry.get("boxes")
+                                        gtl = gt_entry.get("class_labels")
+                                        if isinstance(gtb, torch.Tensor) and isinstance(gtl, torch.Tensor) and gtb.numel():
                                             cxg, cyg, wg, hg = gtb.unbind(-1)
                                             x1g = (cxg - 0.5 * wg) * imgsz
                                             y1g = (cyg - 0.5 * hg) * imgsz
                                             x2g = (cxg + 0.5 * wg) * imgsz
                                             y2g = (cyg + 0.5 * hg) * imgsz
-                                            gt_xyxy = torch.stack([x1g, y1g, x2g, y2g], dim=-1).detach().cpu()
-                                            for gj in range(gt_xyxy.shape[0]):
-                                                boxg = gt_xyxy[gj].tolist()
+                                            gt_xyxy = torch.stack([x1g, y1g, x2g, y2g], dim=-1).detach().cpu().tolist()
+                                            # Draw with PIL to ensure consistent coloring irrespective of annotator API
+                                            pil_canvas = Image.fromarray(canvas)
+                                            draw = ImageDraw.Draw(pil_canvas)
+                                            for gj, boxg in enumerate(gt_xyxy):
                                                 cls_idg = int(gtl[gj].detach().cpu().item())
                                                 cls_name_g = class_names[cls_idg] if class_names and cls_idg < len(class_names) else str(cls_idg)
                                                 draw.rectangle(boxg, outline="green", width=2)
-                                                draw.text((boxg[0] + 2, boxg[1] + 2), f"G {cls_name_g}", fill="green")
+                                                try:
+                                                    draw.text((boxg[0] + 2, boxg[1] + 2), f"G {cls_name_g}", fill="green")
+                                                except Exception:
+                                                    pass
+                                            canvas = np.array(pil_canvas)
+                            except Exception:
+                                pass
+
                             # Save image
                             out_path = vis_dir / f"val_{saved_images:04d}.jpg"
-                            vis_img.save(out_path)
+                            Image.fromarray(canvas).save(out_path)
                             saved_images += 1
                     except Exception as viz_e:  # pragma: no cover
                         try:
@@ -905,17 +943,17 @@ class TransformersDeformableDetrBackend:
                             pass
         avg_loss = sum(losses) / max(1, len(losses))
         map_vals: Dict[str, float] = {}
-        if use_sv_map and pred_dets_all and tgt_dets_all:
+        if use_tm_map and mp is not None:
             try:
-                mp = sv.MeanAveragePrecision.from_detections(predictions=pred_dets_all, targets=tgt_dets_all)
+                res = mp.compute()
                 map_vals = {
-                    "map50_95": float(mp.map50_95),
-                    "map50": float(mp.map50),
-                    "map75": float(mp.map75),
+                    "map50_95": float(res.get("map", torch.tensor(0.0)).item()),
+                    "map50": float(res.get("map_50", torch.tensor(0.0)).item()),
+                    "map75": float(res.get("map_75", torch.tensor(0.0)).item()),
                 }
             except Exception as ce:  # pragma: no cover
                 try:
-                    print(f"[WARN] supervision mAP compute failed: {ce}")
+                    print(f"[WARN] MeanAveragePrecision compute failed: {ce}")
                 except Exception:
                     pass
         metrics = {"val_loss": avg_loss, "samples": preds_collected, **map_vals}
@@ -925,8 +963,8 @@ class TransformersDeformableDetrBackend:
         try:
             extra_vis = f" visualizations={saved_images} -> {vis_dir}" if vis_max > 0 else ""
             map_msg = ""
-            if "map" in metrics:
-                map_msg = f" map={metrics.get('map', float('nan')):.4f} map50={metrics.get('map50', float('nan')):.4f} map75={metrics.get('map75', float('nan')):.4f}"
+            if "map50_95" in metrics:
+                map_msg = f" map50_95={metrics.get('map50_95', float('nan')):.4f} map50={metrics.get('map50', float('nan')):.4f} map75={metrics.get('map75', float('nan')):.4f}"
             print(f"[INFO] Validation finished. samples={preds_collected} val_loss={avg_loss:.4f}{map_msg}{extra_vis} -> {out_dir}/val_metrics.json")
         except Exception:
             pass
