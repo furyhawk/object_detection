@@ -145,5 +145,5 @@ runs/
 # Do not ignore the library data module under od/
 !od/data/
 # !od/data/**
-# ignore notebooks/ children
-notebooks/**
+# ignore notebooks/ subfolders only, not files
+notebooks/*/*
