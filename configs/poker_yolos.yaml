@@ -1,0 +1,47 @@
+# Sample configuration for training/validation with YOLOS (Hugging Face)
+# Mirrors rusty_detr.yaml but swaps the backend/arch for YOLOS.
+
+roboflow:
+  # api_key: null            # optional; will read from ROBOFLOW_API_KEY if null
+  workspace: roboflow-jvuqo
+  project: poker-cards-fmjio
+  version: 4
+  split: yolov8              # export format; 'yolov8' recommended
+  format: null               # override export format if needed
+  location: ./data/poker-cards.v4i.yolov8  # where to store dataset
+  # data_yaml: ./data/data.yaml      # optionally pin a specific data.yaml
+
+model:
+  backend: yolos                         # new backend key added
+  arch: hustvl/yolos-small-dwr           # default YOLOS model id
+  imgsz: 640
+  lr: 0.00007                            # transformers-friendly LR
+  epochs: 20
+  batch: 4
+  device: null                           # e.g. "cuda:0"
+  seed: 42
+  pred_score_thresh: 0.1                 # filtering threshold for validation/vis
+
+train:
+  project_dir: runs/train
+  name: exp_rusty_yolos
+  resume: false
+
+val:
+  project_dir: runs/val
+  name: exp_rusty_yolos
+
+# Light augmentations consumed by the transformers/YOLOS backend
+augmentation:
+  enable: true
+  # ultralytics: {}       # not used by this backend, included for parity
+  hflip: 0.5
+  brightness: 0.2
+  contrast: 0.2
+  hue: 0.02
+  saturation: 0.2
+  scale_min: 0.9
+  scale_max: 1.1
+  rotate: 5
+  blur: 0.0
+  cutout: 0

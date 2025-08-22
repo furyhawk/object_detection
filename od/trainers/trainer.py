@@ -79,6 +79,15 @@ def run_train(cfg: Config, overrides: Optional[Dict[str, Any]] = None) -> Any:
     except Exception:
         pass
 
+    # Build extra args and avoid passing transformers-only keys to other backends
+    extra_args: Dict[str, Any] = {
+        **(overrides or {}),
+        "augmentation": getattr(cfg, "augmentation", None),
+        "val_score_thresh": getattr(cfg.model, "pred_score_thresh", 0.25),
+    }
+    if (cfg.model.backend or "").lower() == "transformers" and model_overrides:
+        extra_args["model_overrides"] = model_overrides
+
     return backend.train(
         data=str(data_yaml),
         project=cfg.train.project_dir,
@@ -89,15 +98,7 @@ def run_train(cfg: Config, overrides: Optional[Dict[str, Any]] = None) -> Any:
         lr=cfg.model.lr,
         seed=cfg.model.seed,
         resume=cfg.train.resume,
-        extra={
-            **(overrides or {}),
-            # Provide augmentation sub-dict for backends to interpret
-            "augmentation": getattr(cfg, "augmentation", None),
-            # unify threshold key for transformers backend (train epoch mAP filtering)
-            "val_score_thresh": getattr(cfg.model, "pred_score_thresh", 0.25),
-            # backend-specific model overrides (consumed by transformers backend)
-            "model_overrides": model_overrides,
-        },
+        extra=extra_args,
     )
 
 

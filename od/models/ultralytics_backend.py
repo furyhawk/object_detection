@@ -45,9 +45,11 @@ class UltralyticsBackend:
                 ultra_args = getattr(aug_cfg, "ultralytics", {}) or {}
                 for k, v in ultra_args.items():
                     args.setdefault(k, v)
+            # Merge remaining extras
             args.update(extra)
         # Remove keys not accepted by Ultralytics train API
         args.pop("val_score_thresh", None)
+        args.pop("model_overrides", None)
         return self.model.train(**args)
 
     def validate(
@@ -73,6 +75,7 @@ class UltralyticsBackend:
             args.update(extra)
         # Strip unsupported keys to avoid Ultralytics cfg alignment errors.
         args.pop("val_score_thresh", None)
+        args.pop("model_overrides", None)
         return self.model.val(**args)
 
     def export(self, format: str = "onnx", **kwargs: Any) -> Any:

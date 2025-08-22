@@ -21,12 +21,12 @@ model:
 
 train:
   project_dir: runs/train
-  name: exp_rusty
+  name: exp_rusty_yolov8
   resume: false
 
 val:
   project_dir: runs/val
-  name: exp_rusty
+  name: exp_rusty_yolov8
 
 augmentation:
   enable: true
