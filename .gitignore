@@ -146,4 +146,5 @@ runs/
 !od/data/
 # !od/data/**
 # ignore notebooks/ subfolders only, not files
-notebooks/*/*
+# notebooks/*/*
+notebooks/
